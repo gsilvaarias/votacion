@@ -227,6 +227,52 @@ function inviteBody(title, link) {
   return { text, html };
 }
 
+/** Correo con los resultados, que se manda a todos los votantes al cerrar. */
+function resultsBody(el, questions, voted, totalVoters) {
+  const lines = [`Resultados de: ${el.title}`, '',
+    `Participación: ${voted} de ${totalVoters} votantes.`, ''];
+  let rows = '';
+  for (const q of questions) {
+    const marks = q.results.reduce((a, r) => a + r.votes, 0);
+    const base = q.pick > 1 ? q.ballots : marks;
+    const pct = (n) => (base ? Math.round(n * 1000 / base) / 10 : 0);
+    const nota = q.pick > 1
+      ? (q.ballots === 1
+        ? `1 papeleta con ${q.pick} marcas`
+        : `${q.ballots} papeletas, cada una con ${q.pick} marcas`)
+      : `${marks} ${marks === 1 ? 'voto' : 'votos'}`;
+
+    lines.push(q.title, `(${nota})`);
+    for (const r of q.results) lines.push(`  - ${r.label}: ${r.votes} (${pct(r.votes)}%)`);
+    lines.push('');
+
+    rows += `<tr><td colspan="3" style="padding:22px 0 2px;font-size:17px;font-weight:700">
+      ${esc(q.title)}</td></tr>
+      <tr><td colspan="3" style="padding:0 0 8px;color:#667085;font-size:13px">${esc(nota)}</td></tr>`;
+    for (const r of q.results) {
+      const w = base ? Math.round(r.votes * 100 / base) : 0;
+      rows += `<tr>
+        <td style="padding:5px 12px 5px 0;font-size:15px">${esc(r.label)}</td>
+        <td style="padding:5px 12px 5px 0;font-size:15px;white-space:nowrap;color:#667085">
+          ${r.votes} · ${pct(r.votes)}%</td>
+        <td style="width:150px;padding:5px 0">
+          <div style="background:#e9edf4;border-radius:5px;height:10px">
+            <div style="background:#2f5bea;border-radius:5px;height:10px;width:${w}%"></div>
+          </div></td></tr>`;
+    }
+  }
+  lines.push(`Puedes consultarlos también en: ${BASE_URL}`);
+  const html = `<div style="font-family:system-ui,Arial,sans-serif;color:#1c2230;max-width:560px">
+    <p style="font-size:19px;font-weight:700;margin:0 0 4px">${esc(el.title)}</p>
+    <p style="color:#667085;margin:0 0 18px">La votación ha terminado. Estos son los resultados.</p>
+    <p style="margin:0 0 6px">Participación: <b>${voted} de ${totalVoters}</b> votantes.</p>
+    <table style="width:100%;border-collapse:collapse">${rows}</table>
+    <p style="margin-top:26px;font-size:13px;color:#667085">
+      También puedes consultarlos en <a href="${esc(BASE_URL)}">${esc(BASE_URL)}</a>.</p>
+  </div>`;
+  return { subject: `Resultados: ${el.title}`, text: lines.join('\n'), html };
+}
+
 /** Genera un token nuevo para un votante y devuelve su enlace personal. */
 async function issueLink(voterId) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -235,7 +281,7 @@ async function issueLink(voterId) {
 }
 
 // ------------------------------------------------- trabajo de envío masivo
-let job = { running: false, total: 0, sent: 0, failed: [], finishedAt: null };
+let job = { running: false, kind: '', total: 0, sent: 0, failed: [], finishedAt: null };
 
 async function runInvitations(onlyPending) {
   if (job.running) return;
@@ -243,7 +289,7 @@ async function runInvitations(onlyPending) {
     `select id, email from voters
      where voted = false ${onlyPending ? 'and invited_at is null' : ''}
      order by id`);
-  job = { running: true, total: voters.length, sent: 0, failed: [], finishedAt: null };
+  job = { running: true, kind: 'invitaciones', total: voters.length, sent: 0, failed: [], finishedAt: null };
   const { title } = await getElection();
   for (const v of voters) {
     try {
@@ -259,6 +305,30 @@ async function runInvitations(onlyPending) {
   }
   job.running = false;
   job.finishedAt = new Date().toISOString();
+}
+
+/** Manda los resultados a TODOS los votantes, hayan votado o no. */
+async function runResults() {
+  if (job.running) return;
+  const { rows: voters } = await pool.query('select email from voters order by id');
+  job = { running: true, kind: 'resultados', total: voters.length, sent: 0, failed: [], finishedAt: null };
+  const el = await getElection();
+  const questions = await tally();
+  const { rows: [c] } = await pool.query(
+    `select count(*) filter (where voted)::int as voted, count(*)::int as total from voters`);
+  const { subject, text, html } = resultsBody(el, questions, c.voted, c.total);
+  for (const v of voters) {
+    try {
+      await sendMail(v.email, subject, html, text);
+      job.sent++;
+    } catch (e) {
+      job.failed.push({ email: v.email, error: e.message });
+    }
+    await sleep(300);
+  }
+  job.running = false;
+  job.finishedAt = new Date().toISOString();
+  await setSettings({ results_sent_at: new Date().toISOString() });
 }
 
 // ---------------------------------------------------------------- servidor
@@ -411,6 +481,7 @@ app.get('/api/admin/state', auth, async (_req, res) => {
     questions: await getQuestions(),
     voters,
     baseUrl: BASE_URL,
+    resultsSentAt: s.results_sent_at || '',
     mail: {
       provider: s.provider || '',
       from_email: s.from_email || '',
@@ -518,6 +589,7 @@ app.post('/api/admin/setup', auth, async (req, res) => {
     for (const e of emails)
       await client.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
     await client.query('commit');
+    await setSettings({ results_sent_at: '' });
     res.json({ ok: true, questions: questions.length, options: nOptions, voters: emails.length, duplicates });
   } catch (e) {
     await client.query('rollback').catch(() => {});
@@ -576,10 +648,23 @@ app.get('/api/admin/links.csv', auth, async (_req, res) => {
     .type('text/csv').send(lines.join('\n'));
 });
 
-app.post('/api/admin/close', auth, async (_req, res) => {
+app.post('/api/admin/close', auth, async (req, res) => {
   const el = await getElection();
   if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta.' });
+  if (req.body?.notify && job.running)
+    return res.status(409).json({ error: 'Espera a que termine el envío en curso.' });
   await pool.query(`update election set status = 'closed' where id = 1`);
+  if (req.body?.notify) runResults().catch((e) => console.error(e));
+  res.json({ ok: true });
+});
+
+// Enviar (o reenviar) los resultados a todos los votantes.
+app.post('/api/admin/results-mail', auth, async (_req, res) => {
+  const el = await getElection();
+  if (el.status !== 'closed')
+    return res.status(409).json({ error: 'Cierra la votación antes de enviar los resultados.' });
+  if (job.running) return res.status(409).json({ error: 'Ya hay un envío en curso.' });
+  runResults().catch((e) => console.error(e));
   res.json({ ok: true });
 });
 
@@ -590,7 +675,8 @@ app.post('/api/admin/reset', auth, async (_req, res) => {
   await pool.query('delete from questions');
   await pool.query('delete from voters');
   await pool.query(`update election set title = '', description = '', status = 'draft' where id = 1`);
-  job = { running: false, total: 0, sent: 0, failed: [], finishedAt: null };
+  await setSettings({ results_sent_at: '' });
+  job = { running: false, kind: '', total: 0, sent: 0, failed: [], finishedAt: null };
   res.json({ ok: true });
 });
 

@@ -17,6 +17,10 @@ secreto y panel de administración guiado.
 3. Abre `https://TU-DIRECCION/admin` (usuario `admin`) y sigue los 4 pasos
    del panel: correo → votación → invitaciones → resultados.
 
+Al cerrar, el panel puede enviar el recuento por correo a toda la lista de
+votantes (`POST /api/admin/close` con `{"notify":true}`, o el botón
+*Enviar los resultados por correo* una vez cerrada).
+
 El envío de correo **no** se configura con variables de entorno, sino dentro
 del panel, con un botón para enviar un correo de prueba.
 

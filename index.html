@@ -95,7 +95,9 @@ function screenClosed(e) {
     return el('section', { className: 'qblock' },
       el('h2', { textContent: q.title }),
       el('p', { className: 'qmeta', textContent: q.pick > 1
-        ? `${q.ballots} ${q.ballots === 1 ? 'papeleta' : 'papeletas'} · cada una marcaba ${q.pick}`
+        ? (q.ballots === 1
+          ? `1 papeleta con ${q.pick} marcas`
+          : `${q.ballots} papeletas · cada una marcaba ${q.pick}`)
         : `${total} ${total === 1 ? 'voto' : 'votos'}` }),
       bars);
   });

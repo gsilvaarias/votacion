@@ -114,6 +114,29 @@ let flash = null;
 const setFlash = (step, text, kind) => { flash = { step, text, kind }; };
 const flashFor = (n) => (flash && flash.step === n ? note(flash.text, flash.kind) : null);
 
+/** Progreso o resumen del último envío, solo del tipo que se pide. */
+function jobStatus(kind, runningText, doneText) {
+  const j = S.job;
+  if (j.kind !== kind || (!j.running && !j.total)) return null;
+  const out = el('div', {});
+  if (j.running) {
+    out.append(el('div', { className: 'note' },
+      el('span', { className: 'spin' }), `${runningText} ${j.sent} de ${j.total}`));
+    return out;
+  }
+  out.append(note(`${doneText}: ${j.sent} de ${j.total} correos enviados`
+    + (j.failed.length ? `, ${j.failed.length} fallaron.` : ' sin errores.'),
+    j.failed.length ? 'warn' : 'ok'));
+  if (j.failed.length) {
+    const t = el('table', {}, el('tr', {},
+      el('th', { textContent: 'Correo' }), el('th', { textContent: 'Motivo' })));
+    for (const f of j.failed.slice(0, 40))
+      t.append(el('tr', {}, el('td', { textContent: f.email }), el('td', { textContent: f.error })));
+    out.append(el('div', { className: 'scroll' }, t));
+  }
+  return out;
+}
+
 function step(n, title, hint, state, ...body) {
   return el('section', { className: 'step ' + state },
     el('div', { className: 'head' },
@@ -364,23 +387,8 @@ function stepInvites() {
   // Abierta
   const pending = S.voters.filter((v) => !v.invited && !v.voted).length;
   const j = S.job;
-  const body = el('div', {});
-
-  if (j.running) {
-    body.append(el('div', { className: 'note' },
-      el('span', { className: 'spin' }),
-      `Enviando invitaciones… ${j.sent} de ${j.total}`));
-  } else if (j.total) {
-    body.append(note(`Último envío: ${j.sent} de ${j.total} correos enviados`
-      + (j.failed.length ? `, ${j.failed.length} fallaron.` : ' sin errores.'),
-      j.failed.length ? 'warn' : 'ok'));
-    if (j.failed.length) {
-      const t = el('table', {}, el('tr', {}, el('th', { textContent: 'Correo' }), el('th', { textContent: 'Motivo' })));
-      for (const f of j.failed.slice(0, 40))
-        t.append(el('tr', {}, el('td', { textContent: f.email }), el('td', { textContent: f.error })));
-      body.append(el('div', { className: 'scroll' }, t));
-    }
-  }
+  const body = el('div', {},
+    jobStatus('invitaciones', 'Enviando invitaciones…', 'Último envío'));
 
   const send = el('button', {
     textContent: pending ? `Enviar a los ${pending} pendientes` : 'No hay invitaciones pendientes',
@@ -433,8 +441,9 @@ function stepResults() {
     }
     return el('div', { className: 'qres' },
       el('label', { textContent: (S.results.length > 1 ? `${i + 1}. ` : '') + q.title }),
-      q.pick > 1 ? el('p', { className: 'hint', textContent:
-        `${q.ballots} ${q.ballots === 1 ? 'papeleta' : 'papeletas'}, cada una con ${q.pick} marcas.` }) : null,
+      q.pick > 1 ? el('p', { className: 'hint', textContent: q.ballots === 1
+        ? `1 papeleta con ${q.pick} marcas.`
+        : `${q.ballots} papeletas, cada una con ${q.pick} marcas.` }) : null,
       table);
   });
 
@@ -445,20 +454,43 @@ function stepResults() {
 
   if (st === 'open') {
     body.append(note('Solo tú ves este conteo. Los votantes lo verán cuando cierres la votación.', 'warn'));
-    const close = el('button', { className: 'danger', textContent: 'Cerrar votación y publicar resultados' });
-    close.onclick = async () => {
+    const cerrar = async (notify, btn) => {
       if (!confirm('Se cierra la votación definitivamente. Quien no haya votado ya no podrá hacerlo '
-        + 'y los resultados quedarán visibles para todos. ¿Continuar?')) return;
-      close.disabled = true;
+        + 'y los resultados quedarán visibles para todos'
+        + (notify ? ', además de enviarse por correo a todos los votantes' : '') + '. ¿Continuar?')) return;
+      btn.disabled = true;
       try {
-        await post('/api/admin/close');
+        await post('/api/admin/close', { notify });
         await load();
+        if (notify) startPolling();
         return;
-      } catch (e) { out.replaceChildren(note(e.message, 'err')); close.disabled = false; }
+      } catch (e) { out.replaceChildren(note(e.message, 'err')); btn.disabled = false; }
     };
-    body.append(close);
+    const closeSend = el('button', { className: 'danger', textContent: 'Cerrar y enviar los resultados a todos' });
+    closeSend.onclick = () => cerrar(true, closeSend);
+    const closeOnly = el('button', { className: 'sec', textContent: 'Cerrar sin enviar correos' });
+    closeOnly.onclick = () => cerrar(false, closeOnly);
+    body.append(closeSend, closeOnly,
+      el('p', { className: 'hint', textContent: 'El correo con los resultados va a toda la lista de votantes, hayan votado o no.' }));
   } else {
-    body.append(note('Votación cerrada. Los resultados ya son públicos en la página de votación.', 'ok'));
+    body.append(note('Votación cerrada. Los resultados ya son públicos en la página de votación.', 'ok'),
+      jobStatus('resultados', 'Enviando los resultados…', 'Envío de resultados'));
+    if (!S.job.running) {
+      const yaSent = !!S.resultsSentAt;
+      const send = el('button', {
+        className: yaSent ? 'sec' : '',
+        textContent: yaSent ? 'Volver a enviar los resultados' : 'Enviar los resultados por correo',
+      });
+      send.onclick = async () => {
+        if (yaSent && !confirm('Los votantes recibirán otra vez el correo con los resultados. ¿Continuar?')) return;
+        send.disabled = true;
+        try { await post('/api/admin/results-mail'); await load(); startPolling(); return; }
+        catch (e) { out.replaceChildren(note(e.message, 'err')); send.disabled = false; }
+      };
+      body.append(send);
+      if (yaSent) body.append(el('p', { className: 'hint',
+        textContent: 'Resultados enviados el ' + new Date(S.resultsSentAt).toLocaleString('es-CO') + '.' }));
+    }
   }
 
   const list = el('table', {}, el('tr', {},
