@@ -59,6 +59,13 @@
   .kv{font-size:.93rem;color:var(--muted);margin:2px 0}
   .kv b{color:var(--ink);font-weight:650}
   code{background:#eef1f6;padding:1px 6px;border-radius:5px;font-size:.88em;word-break:break-all}
+  .qcard{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#fbfcfe}
+  .qhead{display:flex;justify-content:space-between;align-items:center;gap:10px}
+  .qn{font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:700}
+  .qdel{margin:0;padding:5px 11px;font-size:.85rem}
+  .qcard label{margin-top:10px}
+  .qcard textarea{min-height:82px}
+  .qres+.qres{margin-top:18px}
   summary{cursor:pointer;color:var(--muted);font-size:.9rem;padding:4px 0}
   summary:hover{color:var(--brand)}
   details[open] summary{margin-bottom:6px}
@@ -212,41 +219,75 @@ function stepElection() {
   const out = el('div');
 
   if (st === 'draft') {
-    const title = el('input', { value: S.election.title, placeholder: '¿Aprobamos el presupuesto 2027?' });
-    const desc = el('input', { value: S.election.description, placeholder: 'Asamblea ordinaria del 3 de diciembre' });
-    const options = el('textarea', { value: S.results.map((r) => r.label).join('\n'), placeholder: 'Sí\nNo\nAbstención' });
+    const title = el('input', { value: S.election.title, placeholder: 'Asamblea ordinaria del 3 de diciembre' });
+    const desc = el('input', { value: S.election.description, placeholder: 'Sede Bogotá · segunda convocatoria' });
     const emails = el('textarea', { value: S.voters.map((v) => v.email).join('\n'), placeholder: 'ana@correo.com\nluis@correo.com' });
+    const box = el('div', {});
+
+    // Cada pregunta es una tarjeta con su texto y sus opciones. Se añaden y
+    // quitan tocando solo el DOM, para no perder lo que se esté escribiendo.
+    const renumber = () => [...box.children].forEach((c, i) => {
+      c.querySelector('.qn').textContent = 'Pregunta ' + (i + 1);
+      c.querySelector('.qdel').hidden = box.children.length < 2;
+    });
+    const addQuestion = (q) => {
+      const t = el('input', { value: q ? q.title : '', placeholder: '¿Aprobamos el presupuesto 2027?' });
+      const o = el('textarea', { value: q ? q.options.map((x) => x.label).join('\n') : '', placeholder: 'Sí\nNo\nAbstención' });
+      const del = el('button', { className: 'sec qdel', textContent: 'Quitar', type: 'button' });
+      const card = el('div', { className: 'qcard' },
+        el('div', { className: 'qhead' },
+          el('span', { className: 'qn' }),
+          del),
+        t, el('label', { textContent: 'Opciones, una por línea' }), o);
+      del.onclick = () => { card.remove(); renumber(); };
+      box.append(card);
+      renumber();
+      return card;
+    };
+    (S.questions.length ? S.questions : [null]).forEach(addQuestion);
+
+    const addBtn = el('button', { className: 'sec', textContent: '+ Añadir otra pregunta', type: 'button' });
+    addBtn.onclick = () => { addQuestion(null).scrollIntoView({ block: 'nearest' }); };
+
     const save = el('button', { textContent: 'Guardar votación' });
     save.onclick = async () => {
       save.disabled = true;
+      const questions = [...box.children].map((c) => ({
+        title: c.querySelector('input').value,
+        options: c.querySelector('textarea').value,
+      }));
       try {
         const r = await post('/api/admin/setup', {
-          title: title.value, description: desc.value,
-          options: options.value, emails: emails.value,
+          title: title.value, description: desc.value, questions, emails: emails.value,
         });
-        setFlash(2, `Guardado: ${r.options} opciones y ${r.voters} votantes`
+        setFlash(2, `Guardado: ${r.questions} ${r.questions === 1 ? 'pregunta' : 'preguntas'}, `
+          + `${r.options} opciones y ${r.voters} votantes`
           + (r.duplicates ? `. Se ignoraron ${r.duplicates} correos repetidos.` : '.'), 'ok');
         await load();
         return;
       } catch (e) { out.replaceChildren(note(e.message, 'err')); }
       save.disabled = false;
     };
+
     const body = el('div', {},
-      el('label', { textContent: 'Pregunta' }), title,
+      el('label', { textContent: 'Nombre de la votación' }), title,
+      el('p', { className: 'hint', textContent: 'Es el título que ven los votantes arriba de todo. Con una sola pregunta, puedes repetir aquí esa pregunta.' }),
       el('label', { textContent: 'Descripción (opcional)' }), desc,
-      el('label', { textContent: 'Opciones, una por línea' }), options,
+      el('label', { textContent: 'Preguntas' }), box, addBtn,
       el('label', { textContent: 'Correos de los votantes' }), emails,
       el('p', { className: 'hint', textContent: 'Pega la lista tal como la tengas: una por línea, separadas por comas o copiada de Excel. Los repetidos se descartan solos.' }),
       save, out);
-    const done = S.results.length >= 2 && S.voters.length > 0;
+    const done = S.questions.length >= 1 && S.voters.length > 0;
     return step(2, 'Crear la votación', 'Revísala bien: al abrirla ya no podrás cambiarla.',
       done ? 'done' : (S.mail.provider ? 'now' : ''), body);
   }
 
   // Ya abierta o cerrada: resumen y añadir votantes rezagados.
   const info = el('div', {},
-    el('p', { className: 'kv' }, 'Pregunta: ', el('b', { textContent: S.election.title })),
-    el('p', { className: 'kv' }, 'Opciones: ', el('b', { textContent: S.results.map((r) => r.label).join(' · ') })),
+    el('p', { className: 'kv' }, 'Votación: ', el('b', { textContent: S.election.title })),
+    ...S.questions.map((q, i) => el('p', { className: 'kv' },
+      `${i + 1}. `, el('b', { textContent: q.title }),
+      ' — ' + q.options.map((o) => o.label).join(' · '))),
     el('p', { className: 'kv' }, 'Votantes: ', el('b', { textContent: String(S.voters.length) })));
 
   if (st === 'open') {
@@ -274,7 +315,7 @@ function stepElection() {
 function stepInvites() {
   const st = S.election.status;
   const out = el('div');
-  const ready = S.results.length >= 2 && S.voters.length > 0;
+  const ready = S.questions.length >= 1 && S.voters.length > 0;
 
   if (st === 'draft') {
     const open = el('button', { textContent: 'Abrir votación y enviar invitaciones', disabled: !ready });
@@ -355,28 +396,32 @@ function stepResults() {
   if (st === 'draft') return step(4, 'Resultados', 'Aparecerán cuando la votación esté abierta.', '');
 
   const voted = S.voters.filter((v) => v.voted).length;
-  const total = S.results.reduce((a, r) => a + r.votes, 0);
-  const max = Math.max(1, ...S.results.map((r) => r.votes));
   const out = el('div');
 
-  const table = el('table', {}, el('tr', {},
-    el('th', { textContent: 'Opción' }), el('th', { textContent: 'Votos' }),
-    el('th', { textContent: '%' }), el('th', {})));
-  for (const r of S.results) {
-    const fill = el('div', { className: 'fill' });
-    fill.style.width = (r.votes / max * 100) + '%';
-    table.append(el('tr', {},
-      el('td', { textContent: r.label }),
-      el('td', { className: 'r', textContent: String(r.votes) }),
-      el('td', { className: 'r', textContent: total ? (Math.round(r.votes * 1000 / total) / 10) + '%' : '—' }),
-      el('td', {}, el('div', { className: 'track' }, fill))));
-  }
+  const tables = S.results.map((q, i) => {
+    const total = q.results.reduce((a, r) => a + r.votes, 0);
+    const max = Math.max(1, ...q.results.map((r) => r.votes));
+    const table = el('table', {}, el('tr', {},
+      el('th', { textContent: 'Opción' }), el('th', { textContent: 'Votos' }),
+      el('th', { textContent: '%' }), el('th', {})));
+    for (const r of q.results) {
+      const fill = el('div', { className: 'fill' });
+      fill.style.width = (r.votes / max * 100) + '%';
+      table.append(el('tr', {},
+        el('td', { textContent: r.label }),
+        el('td', { className: 'r', textContent: String(r.votes) }),
+        el('td', { className: 'r', textContent: total ? (Math.round(r.votes * 1000 / total) / 10) + '%' : '—' }),
+        el('td', {}, el('div', { className: 'track' }, fill))));
+    }
+    return el('div', { className: 'qres' },
+      el('label', { textContent: S.results.length > 1 ? `${i + 1}. ${q.title}` : q.title }),
+      table);
+  });
 
   const body = el('div', {},
     el('p', { className: 'kv' }, 'Participación: ',
-      el('b', { textContent: `${voted} de ${S.voters.length}` }),
-      total ? ` · ${total} ${total === 1 ? 'voto contado' : 'votos contados'}` : ''),
-    table);
+      el('b', { textContent: `${voted} de ${S.voters.length}` })),
+    tables);
 
   if (st === 'open') {
     body.append(note('Solo tú ves este conteo. Los votantes lo verán cuando cierres la votación.', 'warn'));

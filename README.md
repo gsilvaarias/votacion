@@ -1,8 +1,8 @@
 # App de votación
 
 Votación para un grupo cerrado: lista de correos definida por el organizador,
-enlace personal de un solo uso enviado por correo, voto secreto y panel de
-administración guiado.
+una o varias preguntas en una misma papeleta, enlace personal de un solo uso
+enviado por correo, voto secreto y panel de administración guiado.
 
 **Las instrucciones completas paso a paso están en el documento
 "Manual de la app de votación".** Esto es solo el resumen técnico.
@@ -40,11 +40,16 @@ imprimen en la consola del servidor en vez de enviarse.
 
 ## Notas técnicas
 
+- Una votación tiene N preguntas (`questions`), cada una con sus `options`.
+  El votante responde todas en una sola papeleta y se envían juntas: no se
+  admiten respuestas parciales. Para permitir la abstención, el organizador
+  añade una opción *Abstención*.
 - El voto se guarda en la tabla `votes`, que solo tiene `id` y `option_id`.
   No hay ninguna columna ni tabla que lo relacione con `voters`.
-- Marcar al votante y anular su token ocurre en un único `UPDATE ... WHERE
-  token_hash = $1 AND voted = false` dentro de una transacción, así que dos
-  peticiones simultáneas con el mismo enlace solo producen un voto.
+- Marcar al votante, anular su token e insertar sus N votos ocurre en una sola
+  transacción, y el votante se marca con un único `UPDATE ... WHERE
+  token_hash = $1 AND voted = false`. Así, dos peticiones simultáneas con el
+  mismo enlace producen exactamente una papeleta, nunca votos a medias.
 - Los tokens se guardan hasheados con SHA-256; la app nunca almacena el token
   en claro.
 - El correo se envía por la API HTTP de Brevo (puerto 443) porque el plan

@@ -64,6 +64,10 @@ async function init() {
       title text not null default '',
       description text not null default '',
       status text not null default 'draft');
+    create table if not exists questions(
+      id serial primary key,
+      title text not null,
+      position int not null);
     create table if not exists options(
       id serial primary key,
       label text not null,
@@ -80,8 +84,35 @@ async function init() {
       option_id int not null references options(id) on delete cascade);
     insert into election(id) values (1) on conflict do nothing;
   `);
-  // Compatibilidad con bases creadas por la versión 1.
+  // Compatibilidad con bases creadas por versiones anteriores.
   await pool.query(`alter table voters add column if not exists invited_at timestamptz`);
+  await pool.query(`alter table options add column if not exists question_id int
+                    references questions(id) on delete cascade`);
+  // Si quedaron opciones de cuando solo había una pregunta, se agrupan bajo
+  // una pregunta hecha con el título de la votación.
+  const { rows: [{ n }] } = await pool.query(
+    'select count(*)::int as n from options where question_id is null');
+  if (n > 0) {
+    const { rows: [el] } = await pool.query('select title from election where id = 1');
+    const { rows: [q] } = await pool.query(
+      'insert into questions(title, position) values ($1, 0) returning id', [el.title || 'Pregunta']);
+    await pool.query('update options set question_id = $1 where question_id is null', [q.id]);
+  }
+}
+
+/** Devuelve las preguntas con sus opciones, en orden. */
+async function getQuestions() {
+  const { rows } = await pool.query(`
+    select q.id as qid, q.title, o.id as oid, o.label
+    from questions q left join options o on o.question_id = q.id
+    order by q.position, o.position`);
+  const out = [];
+  for (const r of rows) {
+    let q = out.find((x) => x.id === r.qid);
+    if (!q) { q = { id: r.qid, title: r.title, options: [] }; out.push(q); }
+    if (r.oid) q.options.push({ id: r.oid, label: r.label });
+  }
+  return out;
 }
 
 const getSettings = async () => {
@@ -98,12 +129,22 @@ const getElection = async () => {
   const { rows: [el] } = await pool.query('select title, description, status from election where id = 1');
   return el;
 };
+/** Conteo agrupado por pregunta. */
 const tally = async () => {
   const { rows } = await pool.query(`
-    select o.label, count(v.id)::int as votes
-    from options o left join votes v on v.option_id = o.id
-    group by o.id, o.label, o.position order by o.position`);
-  return rows;
+    select q.id as qid, q.title, o.label, count(v.id)::int as votes
+    from questions q
+    join options o on o.question_id = q.id
+    left join votes v on v.option_id = o.id
+    group by q.id, q.title, q.position, o.id, o.label, o.position
+    order by q.position, o.position`);
+  const out = [];
+  for (const r of rows) {
+    let q = out.find((x) => x.id === r.qid);
+    if (!q) { q = { id: r.qid, title: r.title, results: [] }; out.push(q); }
+    q.results.push({ label: r.label, votes: r.votes });
+  }
+  return out;
 };
 
 // ------------------------------------------------------------------- correo
@@ -271,12 +312,11 @@ app.get('/api/ballot', limit(2000, 3600_000), async (req, res) => {
     'select id from voters where token_hash = $1 and voted = false', [sha(req.query.t || '')]);
   if (!voter) return res.status(403).json({ error: 'Este enlace no es válido o ya fue utilizado.' });
   if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
-  const { rows: options } = await pool.query('select id, label from options order by position');
-  res.json({ title: el.title, description: el.description, options });
+  res.json({ title: el.title, description: el.description, questions: await getQuestions() });
 });
 
 app.post('/api/vote', limit(2000, 3600_000), async (req, res) => {
-  const { token, optionId } = req.body || {};
+  const { token, answers } = req.body || {};
   const client = await pool.connect();
   try {
     await client.query('begin');
@@ -285,8 +325,25 @@ app.post('/api/vote', limit(2000, 3600_000), async (req, res) => {
       await client.query('rollback');
       return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
     }
-    const { rows: [opt] } = await client.query('select id from options where id = $1', [+optionId || 0]);
-    if (!opt) { await client.query('rollback'); return res.status(400).json({ error: 'Opción no válida.' }); }
+
+    // Hay que responder a todas las preguntas, y cada opción elegida debe
+    // pertenecer a su propia pregunta.
+    const { rows: questions } = await client.query('select id from questions order by position');
+    const chosen = [];
+    for (const q of questions) {
+      const optId = +((answers || {})[q.id]) || 0;
+      const { rows: [opt] } = await client.query(
+        'select id from options where id = $1 and question_id = $2', [optId, q.id]);
+      if (!opt) {
+        await client.query('rollback');
+        return res.status(400).json({ error: 'Falta responder alguna pregunta.' });
+      }
+      chosen.push(opt.id);
+    }
+    if (!chosen.length) {
+      await client.query('rollback');
+      return res.status(400).json({ error: 'La votación no tiene preguntas.' });
+    }
 
     // Marca al votante y anula su token en una sola operación atómica.
     // Si dos peticiones llegan a la vez, solo una afecta una fila.
@@ -297,8 +354,8 @@ app.post('/api/vote', limit(2000, 3600_000), async (req, res) => {
       await client.query('rollback');
       return res.status(403).json({ error: 'Este enlace no es válido o ya fue utilizado.' });
     }
-    // El voto se guarda sin ninguna referencia al votante.
-    await client.query('insert into votes(option_id) values ($1)', [opt.id]);
+    // Los votos se guardan sin ninguna referencia al votante.
+    for (const id of chosen) await client.query('insert into votes(option_id) values ($1)', [id]);
     await client.query('commit');
     res.json({ ok: true });
   } catch (e) {
@@ -328,6 +385,7 @@ app.get('/api/admin/state', auth, async (_req, res) => {
   res.json({
     election: await getElection(),
     results: await tally(),
+    questions: await getQuestions(),
     voters,
     baseUrl: BASE_URL,
     mail: {
@@ -381,12 +439,27 @@ app.post('/api/admin/mail-test', auth, async (req, res) => {
 app.post('/api/admin/setup', auth, async (req, res) => {
   const title = String(req.body?.title || '').trim();
   const description = String(req.body?.description || '').trim();
-  const options = String(req.body?.options || '').split('\n').map((o) => o.trim()).filter(Boolean);
   const { emails, duplicates } = parseEmails(req.body?.emails);
 
-  if (!title) return res.status(400).json({ error: 'Escribe la pregunta de la votación.' });
-  if (options.length < 2) return res.status(400).json({ error: 'Escribe al menos 2 opciones, una por línea.' });
-  if (options.length > 50) return res.status(400).json({ error: 'Máximo 50 opciones.' });
+  // Cada pregunta trae su propio texto y sus opciones, una por línea.
+  const questions = (Array.isArray(req.body?.questions) ? req.body.questions : [])
+    .map((q) => ({
+      title: String(q?.title || '').trim(),
+      options: String(q?.options || '').split('\n').map((o) => o.replace(/^[-*•]\s*/, '').trim()).filter(Boolean),
+    }))
+    .filter((q) => q.title || q.options.length);
+
+  if (!title) return res.status(400).json({ error: 'Escribe el nombre de la votación.' });
+  if (!questions.length) return res.status(400).json({ error: 'Añade al menos una pregunta.' });
+  if (questions.length > 30) return res.status(400).json({ error: 'Máximo 30 preguntas.' });
+  for (let i = 0; i < questions.length; i++) {
+    const n = questions.length > 1 ? ` (pregunta ${i + 1})` : '';
+    if (!questions[i].title) return res.status(400).json({ error: `Falta el texto de la pregunta${n}.` });
+    if (questions[i].options.length < 2)
+      return res.status(400).json({ error: `Escribe al menos 2 opciones, una por línea${n}.` });
+    if (questions[i].options.length > 50)
+      return res.status(400).json({ error: `Máximo 50 opciones por pregunta${n}.` });
+  }
   if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido en la lista de votantes.' });
 
   const client = await pool.connect();
@@ -399,14 +472,23 @@ app.post('/api/admin/setup', auth, async (req, res) => {
     }
     await client.query('delete from votes');
     await client.query('delete from options');
+    await client.query('delete from questions');
     await client.query('delete from voters');
     await client.query('update election set title = $1, description = $2 where id = 1', [title, description]);
-    for (let i = 0; i < options.length; i++)
-      await client.query('insert into options(label, position) values ($1, $2)', [options[i], i]);
+    let nOptions = 0;
+    for (let i = 0; i < questions.length; i++) {
+      const { rows: [q] } = await client.query(
+        'insert into questions(title, position) values ($1, $2) returning id', [questions[i].title, i]);
+      for (let j = 0; j < questions[i].options.length; j++) {
+        await client.query('insert into options(question_id, label, position) values ($1, $2, $3)',
+          [q.id, questions[i].options[j], j]);
+        nOptions++;
+      }
+    }
     for (const e of emails)
       await client.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
     await client.query('commit');
-    res.json({ ok: true, options: options.length, voters: emails.length, duplicates });
+    res.json({ ok: true, questions: questions.length, options: nOptions, voters: emails.length, duplicates });
   } catch (e) {
     await client.query('rollback').catch(() => {});
     console.error(e);
@@ -433,8 +515,13 @@ app.post('/api/admin/voters-add', auth, async (req, res) => {
 app.post('/api/admin/open', auth, async (req, res) => {
   const el = await getElection();
   if (el.status !== 'draft') return res.status(409).json({ error: 'La votación ya fue abierta.' });
-  const { rows: [{ n }] } = await pool.query('select count(*)::int as n from options');
-  if (n < 2) return res.status(400).json({ error: 'Configura la votación antes de abrirla.' });
+  const { rows: [{ n }] } = await pool.query('select count(*)::int as n from questions');
+  if (n < 1) return res.status(400).json({ error: 'Configura la votación antes de abrirla.' });
+  // Ninguna pregunta puede quedarse sin opciones con las que votar.
+  const { rows: [{ bad }] } = await pool.query(`
+    select count(*)::int as bad from questions q
+    where (select count(*) from options o where o.question_id = q.id) < 2`);
+  if (bad > 0) return res.status(400).json({ error: 'Hay preguntas con menos de 2 opciones. Vuelve a guardar la votación.' });
   await pool.query(`update election set status = 'open' where id = 1`);
   if (req.body?.invite) runInvitations(true).catch((e) => console.error(e));
   res.json({ ok: true });
@@ -470,6 +557,7 @@ app.post('/api/admin/reset', auth, async (_req, res) => {
   if (job.running) return res.status(409).json({ error: 'Espera a que termine el envío de invitaciones.' });
   await pool.query('delete from votes');
   await pool.query('delete from options');
+  await pool.query('delete from questions');
   await pool.query('delete from voters');
   await pool.query(`update election set title = '', description = '', status = 'draft' where id = 1`);
   job = { running: false, total: 0, sent: 0, failed: [], finishedAt: null };

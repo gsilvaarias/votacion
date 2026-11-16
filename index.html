@@ -34,6 +34,12 @@
   .bar .name{font-weight:600} .bar .num{color:var(--muted);flex:none}
   .track{height:11px;background:#e9edf4;border-radius:6px;overflow:hidden;margin-top:5px}
   .fill{height:100%;background:var(--brand);border-radius:6px}
+  .qblock{margin:0 0 26px}
+  .qblock+.qblock{padding-top:22px;border-top:1px solid var(--line)}
+  .qblock h2{font-size:1.1rem;margin:0 0 13px;line-height:1.35}
+  .qmeta{margin:0 0 4px;color:var(--muted);font-size:.83rem;
+         text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .qblock .qmeta+h2{margin-top:2px}
   .big{font-size:2.6rem;line-height:1;margin:0 0 14px}
   .foot{text-align:center;color:var(--muted);font-size:.87rem;margin-top:22px}
 </style>
@@ -65,21 +71,27 @@ async function api(url, body) {
 
 // ---------- pantallas ----------
 function screenClosed(e) {
-  const total = e.results.reduce((s, r) => s + r.votes, 0);
-  const max = Math.max(1, ...e.results.map((r) => r.votes));
-  const bars = e.results.map((r) => {
-    const pct = total ? Math.round(r.votes * 1000 / total) / 10 : 0;
-    const fill = el('div', { className: 'fill' });
-    fill.style.width = (r.votes / max * 100) + '%';
-    return el('div', { className: 'bar' },
-      el('div', { className: 'row' },
-        el('span', { className: 'name', textContent: r.label }),
-        el('span', { className: 'num', textContent: `${r.votes} · ${pct}%` })),
-      el('div', { className: 'track' }, fill));
+  const blocks = e.results.map((q) => {
+    const total = q.results.reduce((s, r) => s + r.votes, 0);
+    const max = Math.max(1, ...q.results.map((r) => r.votes));
+    const bars = q.results.map((r) => {
+      const pct = total ? Math.round(r.votes * 1000 / total) / 10 : 0;
+      const fill = el('div', { className: 'fill' });
+      fill.style.width = (r.votes / max * 100) + '%';
+      return el('div', { className: 'bar' },
+        el('div', { className: 'row' },
+          el('span', { className: 'name', textContent: r.label }),
+          el('span', { className: 'num', textContent: `${r.votes} · ${pct}%` })),
+        el('div', { className: 'track' }, fill));
+    });
+    return el('section', { className: 'qblock' },
+      el('h2', { textContent: q.title }),
+      el('p', { className: 'qmeta', textContent: `${total} ${total === 1 ? 'voto' : 'votos'}` }),
+      bars);
   });
   show(el('h1', { textContent: e.title }),
-    el('p', { className: 'desc', textContent: `Votación cerrada · ${total} ${total === 1 ? 'voto' : 'votos'} en total` }),
-    bars);
+    el('p', { className: 'desc', textContent: 'Votación cerrada' }),
+    blocks);
 }
 
 function screenRequest(e, notice) {
@@ -108,20 +120,37 @@ function screenRequest(e, notice) {
 
 async function screenBallot() {
   const b = await api('/api/ballot?t=' + encodeURIComponent(token));
-  let chosen = null;
+  const answers = {};
+  const many = b.questions.length > 1;
   const btn = el('button', { textContent: 'Emitir mi voto', disabled: true });
   const out = el('div');
-  const opts = b.options.map((o) => {
-    const radio = el('input', { type: 'radio', name: 'opcion', value: String(o.id) });
-    radio.onchange = () => { chosen = o.id; btn.disabled = false; };
-    return el('label', { className: 'opt' }, radio, el('span', { textContent: o.label }));
+
+  const refresh = () => {
+    const left = b.questions.length - Object.keys(answers).length;
+    btn.disabled = left > 0;
+    btn.textContent = left > 0
+      ? (left === 1 ? 'Falta 1 pregunta por responder' : `Faltan ${left} preguntas por responder`)
+      : 'Emitir mi voto';
+  };
+
+  const blocks = b.questions.map((q, i) => {
+    const opts = q.options.map((o) => {
+      const radio = el('input', { type: 'radio', name: 'q' + q.id, value: String(o.id) });
+      radio.onchange = () => { answers[q.id] = o.id; refresh(); };
+      return el('label', { className: 'opt' }, radio, el('span', { textContent: o.label }));
+    });
+    return el('section', { className: 'qblock' },
+      many ? el('p', { className: 'qmeta', textContent: `Pregunta ${i + 1} de ${b.questions.length}` }) : null,
+      el('h2', { textContent: q.title }),
+      opts);
   });
+
   btn.onclick = async () => {
     if (!confirm('Tu voto es definitivo y no se puede cambiar. ¿Confirmas?')) return;
     btn.disabled = true;
     out.replaceChildren();
     try {
-      await api('/api/vote', { token, optionId: chosen });
+      await api('/api/vote', { token, answers });
       history.replaceState(null, '', '/');
       show(el('p', { className: 'big', textContent: '✓' }),
         el('h1', { textContent: 'Voto registrado' }),
@@ -129,13 +158,16 @@ async function screenBallot() {
         el('p', { className: 'foot', textContent: 'Ya puedes cerrar esta página.' }));
     } catch (err) {
       out.replaceChildren(msg(err.message, 'err'));
-      btn.disabled = false;
+      refresh();
     }
   };
+  refresh(); // Deja el botón diciendo cuántas preguntas faltan desde el inicio.
   show(el('h1', { textContent: b.title }),
     b.description ? el('p', { className: 'desc', textContent: b.description }) : null,
-    opts, btn, out,
-    el('p', { className: 'foot', textContent: 'Puedes votar una sola vez.' }));
+    blocks, btn, out,
+    el('p', { className: 'foot', textContent: many
+      ? 'Responde todas las preguntas. Se envían juntas y solo puedes votar una vez.'
+      : 'Puedes votar una sola vez.' }));
 }
 
 async function main() {
