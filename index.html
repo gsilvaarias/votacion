@@ -40,6 +40,11 @@
   .qmeta{margin:0 0 4px;color:var(--muted);font-size:.83rem;
          text-transform:uppercase;letter-spacing:.05em;font-weight:600}
   .qblock .qmeta+h2{margin-top:2px}
+  .qhelp{margin:-5px 0 12px;font-size:.92rem;font-weight:600;color:var(--brand)}
+  .qhelp.ok{color:var(--ok)}
+  .qhelp.ok::after{content:" ✓"}
+  label.opt.off{opacity:.45}
+  label.opt.off:hover{border-color:var(--line)}
   .big{font-size:2.6rem;line-height:1;margin:0 0 14px}
   .foot{text-align:center;color:var(--muted);font-size:.87rem;margin-top:22px}
 </style>
@@ -73,9 +78,12 @@ async function api(url, body) {
 function screenClosed(e) {
   const blocks = e.results.map((q) => {
     const total = q.results.reduce((s, r) => s + r.votes, 0);
+    // Si cada papeleta marcaba varias opciones, el porcentaje se calcula
+    // sobre el número de papeletas, no sobre el total de marcas.
+    const base = q.pick > 1 ? q.ballots : total;
     const max = Math.max(1, ...q.results.map((r) => r.votes));
     const bars = q.results.map((r) => {
-      const pct = total ? Math.round(r.votes * 1000 / total) / 10 : 0;
+      const pct = base ? Math.round(r.votes * 1000 / base) / 10 : 0;
       const fill = el('div', { className: 'fill' });
       fill.style.width = (r.votes / max * 100) + '%';
       return el('div', { className: 'bar' },
@@ -86,7 +94,9 @@ function screenClosed(e) {
     });
     return el('section', { className: 'qblock' },
       el('h2', { textContent: q.title }),
-      el('p', { className: 'qmeta', textContent: `${total} ${total === 1 ? 'voto' : 'votos'}` }),
+      el('p', { className: 'qmeta', textContent: q.pick > 1
+        ? `${q.ballots} ${q.ballots === 1 ? 'papeleta' : 'papeletas'} · cada una marcaba ${q.pick}`
+        : `${total} ${total === 1 ? 'voto' : 'votos'}` }),
       bars);
   });
   show(el('h1', { textContent: e.title }),
@@ -125,8 +135,11 @@ async function screenBallot() {
   const btn = el('button', { textContent: 'Emitir mi voto', disabled: true });
   const out = el('div');
 
+  // Una pregunta está respondida cuando tiene marcadas exactamente las
+  // opciones que pide (1 en las normales, varias en las de candidatos).
+  const ready = (q) => (answers[q.id] || []).length === q.pick;
   const refresh = () => {
-    const left = b.questions.length - Object.keys(answers).length;
+    const left = b.questions.filter((q) => !ready(q)).length;
     btn.disabled = left > 0;
     btn.textContent = left > 0
       ? (left === 1 ? 'Falta 1 pregunta por responder' : `Faltan ${left} preguntas por responder`)
@@ -134,14 +147,41 @@ async function screenBallot() {
   };
 
   const blocks = b.questions.map((q, i) => {
+    answers[q.id] = [];
+    const multi = q.pick > 1;
+    const help = multi ? el('p', { className: 'qhelp' }) : null;
+    const inputs = [];
+
+    const sync = () => {
+      const n = answers[q.id].length;
+      if (multi) {
+        // Al llegar al tope, se apagan las casillas sin marcar: para cambiar
+        // de opinión hay que desmarcar una primero.
+        inputs.forEach((inp) => { inp.disabled = !inp.checked && n >= q.pick; });
+        inputs.forEach((inp) => inp.closest('label').classList.toggle('off', inp.disabled));
+        help.textContent = `Marca ${q.pick} opciones · llevas ${n}`;
+        help.classList.toggle('ok', n === q.pick);
+      }
+      refresh();
+    };
+
     const opts = q.options.map((o) => {
-      const radio = el('input', { type: 'radio', name: 'q' + q.id, value: String(o.id) });
-      radio.onchange = () => { answers[q.id] = o.id; refresh(); };
-      return el('label', { className: 'opt' }, radio, el('span', { textContent: o.label }));
+      const inp = el('input', { type: multi ? 'checkbox' : 'radio', name: 'q' + q.id, value: String(o.id) });
+      inputs.push(inp);
+      inp.onchange = () => {
+        answers[q.id] = multi
+          ? (inp.checked ? [...answers[q.id], o.id] : answers[q.id].filter((x) => x !== o.id))
+          : [o.id];
+        sync();
+      };
+      return el('label', { className: 'opt' }, inp, el('span', { textContent: o.label }));
     });
+    if (multi) sync();
+
     return el('section', { className: 'qblock' },
       many ? el('p', { className: 'qmeta', textContent: `Pregunta ${i + 1} de ${b.questions.length}` }) : null,
       el('h2', { textContent: q.title }),
+      help,
       opts);
   });
 

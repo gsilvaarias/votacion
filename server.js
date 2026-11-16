@@ -67,7 +67,8 @@ async function init() {
     create table if not exists questions(
       id serial primary key,
       title text not null,
-      position int not null);
+      position int not null,
+      pick int not null default 1);
     create table if not exists options(
       id serial primary key,
       label text not null,
@@ -88,6 +89,8 @@ async function init() {
   await pool.query(`alter table voters add column if not exists invited_at timestamptz`);
   await pool.query(`alter table options add column if not exists question_id int
                     references questions(id) on delete cascade`);
+  // pick = cuántas opciones debe marcar el votante en esa pregunta.
+  await pool.query(`alter table questions add column if not exists pick int not null default 1`);
   // Si quedaron opciones de cuando solo había una pregunta, se agrupan bajo
   // una pregunta hecha con el título de la votación.
   const { rows: [{ n }] } = await pool.query(
@@ -103,13 +106,13 @@ async function init() {
 /** Devuelve las preguntas con sus opciones, en orden. */
 async function getQuestions() {
   const { rows } = await pool.query(`
-    select q.id as qid, q.title, o.id as oid, o.label
+    select q.id as qid, q.title, q.pick, o.id as oid, o.label
     from questions q left join options o on o.question_id = q.id
     order by q.position, o.position`);
   const out = [];
   for (const r of rows) {
     let q = out.find((x) => x.id === r.qid);
-    if (!q) { q = { id: r.qid, title: r.title, options: [] }; out.push(q); }
+    if (!q) { q = { id: r.qid, title: r.title, pick: r.pick, options: [] }; out.push(q); }
     if (r.oid) q.options.push({ id: r.oid, label: r.label });
   }
   return out;
@@ -132,17 +135,23 @@ const getElection = async () => {
 /** Conteo agrupado por pregunta. */
 const tally = async () => {
   const { rows } = await pool.query(`
-    select q.id as qid, q.title, o.label, count(v.id)::int as votes
+    select q.id as qid, q.title, q.pick, o.label, count(v.id)::int as votes
     from questions q
     join options o on o.question_id = q.id
     left join votes v on v.option_id = o.id
-    group by q.id, q.title, q.position, o.id, o.label, o.position
+    group by q.id, q.title, q.pick, q.position, o.id, o.label, o.position
     order by q.position, o.position`);
   const out = [];
   for (const r of rows) {
     let q = out.find((x) => x.id === r.qid);
-    if (!q) { q = { id: r.qid, title: r.title, results: [] }; out.push(q); }
+    if (!q) { q = { id: r.qid, title: r.title, pick: r.pick, results: [] }; out.push(q); }
     q.results.push({ label: r.label, votes: r.votes });
+  }
+  // Con pick > 1 cada papeleta deja varias marcas, así que el número de
+  // papeletas es lo que sirve de referencia para los porcentajes.
+  for (const q of out) {
+    const marks = q.results.reduce((a, r) => a + r.votes, 0);
+    q.ballots = q.pick > 0 ? Math.round(marks / q.pick) : 0;
   }
   return out;
 };
@@ -328,17 +337,31 @@ app.post('/api/vote', limit(2000, 3600_000), async (req, res) => {
 
     // Hay que responder a todas las preguntas, y cada opción elegida debe
     // pertenecer a su propia pregunta.
-    const { rows: questions } = await client.query('select id from questions order by position');
+    const { rows: questions } = await client.query(
+      'select id, title, pick from questions order by position');
     const chosen = [];
     for (const q of questions) {
-      const optId = +((answers || {})[q.id]) || 0;
-      const { rows: [opt] } = await client.query(
-        'select id from options where id = $1 and question_id = $2', [optId, q.id]);
-      if (!opt) {
+      // La respuesta puede venir como un id suelto o como lista de ids.
+      const raw = (answers || {})[q.id];
+      const ids = [...new Set((Array.isArray(raw) ? raw : [raw])
+        .map((x) => +x).filter((x) => Number.isInteger(x) && x > 0))];
+
+      if (ids.length !== q.pick) {
         await client.query('rollback');
-        return res.status(400).json({ error: 'Falta responder alguna pregunta.' });
+        return res.status(400).json({
+          error: q.pick === 1
+            ? `Falta responder: "${q.title}".`
+            : `En "${q.title}" tienes que marcar exactamente ${q.pick} opciones.`,
+        });
       }
-      chosen.push(opt.id);
+      // Todas las opciones elegidas deben pertenecer a esa misma pregunta.
+      const { rows: valid } = await client.query(
+        'select id from options where question_id = $1 and id = any($2::int[])', [q.id, ids]);
+      if (valid.length !== ids.length) {
+        await client.query('rollback');
+        return res.status(400).json({ error: `Hay una opción no válida en "${q.title}".` });
+      }
+      chosen.push(...valid.map((o) => o.id));
     }
     if (!chosen.length) {
       await client.query('rollback');
@@ -445,6 +468,7 @@ app.post('/api/admin/setup', auth, async (req, res) => {
   const questions = (Array.isArray(req.body?.questions) ? req.body.questions : [])
     .map((q) => ({
       title: String(q?.title || '').trim(),
+      pick: Math.max(1, Math.min(50, parseInt(q?.pick, 10) || 1)),
       options: String(q?.options || '').split('\n').map((o) => o.replace(/^[-*•]\s*/, '').trim()).filter(Boolean),
     }))
     .filter((q) => q.title || q.options.length);
@@ -459,6 +483,11 @@ app.post('/api/admin/setup', auth, async (req, res) => {
       return res.status(400).json({ error: `Escribe al menos 2 opciones, una por línea${n}.` });
     if (questions[i].options.length > 50)
       return res.status(400).json({ error: `Máximo 50 opciones por pregunta${n}.` });
+    if (questions[i].pick > questions[i].options.length)
+      return res.status(400).json({
+        error: `Pides marcar ${questions[i].pick} opciones pero solo hay `
+          + `${questions[i].options.length}${n}.`,
+      });
   }
   if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido en la lista de votantes.' });
 
@@ -478,7 +507,8 @@ app.post('/api/admin/setup', auth, async (req, res) => {
     let nOptions = 0;
     for (let i = 0; i < questions.length; i++) {
       const { rows: [q] } = await client.query(
-        'insert into questions(title, position) values ($1, $2) returning id', [questions[i].title, i]);
+        'insert into questions(title, position, pick) values ($1, $2, $3) returning id',
+        [questions[i].title, i, questions[i].pick]);
       for (let j = 0; j < questions[i].options.length; j++) {
         await client.query('insert into options(question_id, label, position) values ($1, $2, $3)',
           [q.id, questions[i].options[j], j]);
@@ -517,11 +547,11 @@ app.post('/api/admin/open', auth, async (req, res) => {
   if (el.status !== 'draft') return res.status(409).json({ error: 'La votación ya fue abierta.' });
   const { rows: [{ n }] } = await pool.query('select count(*)::int as n from questions');
   if (n < 1) return res.status(400).json({ error: 'Configura la votación antes de abrirla.' });
-  // Ninguna pregunta puede quedarse sin opciones con las que votar.
+  // Ninguna pregunta puede pedir más marcas que opciones tiene.
   const { rows: [{ bad }] } = await pool.query(`
     select count(*)::int as bad from questions q
-    where (select count(*) from options o where o.question_id = q.id) < 2`);
-  if (bad > 0) return res.status(400).json({ error: 'Hay preguntas con menos de 2 opciones. Vuelve a guardar la votación.' });
+    where (select count(*) from options o where o.question_id = q.id) < greatest(2, q.pick)`);
+  if (bad > 0) return res.status(400).json({ error: 'Hay preguntas con menos opciones de las que piden marcar. Vuelve a guardar la votación.' });
   await pool.query(`update election set status = 'open' where id = 1`);
   if (req.body?.invite) runInvitations(true).catch((e) => console.error(e));
   res.json({ ok: true });

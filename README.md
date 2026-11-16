@@ -1,8 +1,9 @@
 # App de votación
 
 Votación para un grupo cerrado: lista de correos definida por el organizador,
-una o varias preguntas en una misma papeleta, enlace personal de un solo uso
-enviado por correo, voto secreto y panel de administración guiado.
+una o varias preguntas en una misma papeleta (cada una de opción única o de
+elegir N candidatos), enlace personal de un solo uso enviado por correo, voto
+secreto y panel de administración guiado.
 
 **Las instrucciones completas paso a paso están en el documento
 "Manual de la app de votación".** Esto es solo el resumen técnico.
@@ -40,10 +41,15 @@ imprimen en la consola del servidor en vez de enviarse.
 
 ## Notas técnicas
 
-- Una votación tiene N preguntas (`questions`), cada una con sus `options`.
-  El votante responde todas en una sola papeleta y se envían juntas: no se
-  admiten respuestas parciales. Para permitir la abstención, el organizador
-  añade una opción *Abstención*.
+- Una votación tiene N preguntas (`questions`), cada una con sus `options` y
+  un `pick`: cuántas opciones debe marcar el votante en esa pregunta (1 por
+  defecto; 4 para elegir cuatro candidatos de una lista). El votante responde
+  todas las preguntas en una sola papeleta y se envían juntas: no se admiten
+  respuestas parciales ni un número de marcas distinto de `pick`. Para
+  permitir la abstención, el organizador añade una opción *Abstención*.
+- Con `pick > 1`, cada papeleta deja `pick` filas en `votes`, así que el
+  recuento informa también de `ballots` (= marcas / `pick`) y los porcentajes
+  se calculan sobre las papeletas, no sobre el total de marcas.
 - El voto se guarda en la tabla `votes`, que solo tiene `id` y `option_id`.
   No hay ninguna columna ni tabla que lo relacione con `voters`.
 - Marcar al votante, anular su token e insertar sus N votos ocurre en una sola

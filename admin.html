@@ -65,6 +65,9 @@
   .qdel{margin:0;padding:5px 11px;font-size:.85rem}
   .qcard label{margin-top:10px}
   .qcard textarea{min-height:82px}
+  .pickrow{display:flex;align-items:center;gap:12px}
+  .pickrow .qpick{width:78px;flex:none}
+  .pickrow .hint{margin:0}
   .qres+.qres{margin-top:18px}
   summary{cursor:pointer;color:var(--muted);font-size:.9rem;padding:4px 0}
   summary:hover{color:var(--brand)}
@@ -231,14 +234,25 @@ function stepElection() {
       c.querySelector('.qdel').hidden = box.children.length < 2;
     });
     const addQuestion = (q) => {
-      const t = el('input', { value: q ? q.title : '', placeholder: '¿Aprobamos el presupuesto 2027?' });
-      const o = el('textarea', { value: q ? q.options.map((x) => x.label).join('\n') : '', placeholder: 'Sí\nNo\nAbstención' });
+      const t = el('input', { className: 'qtitle', value: q ? q.title : '', placeholder: '¿Aprobamos el presupuesto 2027?' });
+      const o = el('textarea', { className: 'qopts', value: q ? q.options.map((x) => x.label).join('\n') : '', placeholder: 'Sí\nNo\nAbstención' });
+      const pick = el('input', { className: 'qpick', type: 'number', min: '1', max: '50', value: String(q ? q.pick : 1) });
+      const hint = el('p', { className: 'hint' });
+      const syncHint = () => {
+        const n = Math.max(1, parseInt(pick.value, 10) || 1);
+        hint.textContent = n === 1
+          ? 'Cada votante marca una sola opción.'
+          : `Cada votante tendrá que marcar exactamente ${n} opciones, ni más ni menos.`;
+      };
+      pick.oninput = syncHint;
+      syncHint();
       const del = el('button', { className: 'sec qdel', textContent: 'Quitar', type: 'button' });
       const card = el('div', { className: 'qcard' },
-        el('div', { className: 'qhead' },
-          el('span', { className: 'qn' }),
-          del),
-        t, el('label', { textContent: 'Opciones, una por línea' }), o);
+        el('div', { className: 'qhead' }, el('span', { className: 'qn' }), del),
+        t,
+        el('label', { textContent: 'Opciones, una por línea' }), o,
+        el('label', { textContent: 'Opciones que debe marcar cada votante' }),
+        el('div', { className: 'pickrow' }, pick, hint));
       del.onclick = () => { card.remove(); renumber(); };
       box.append(card);
       renumber();
@@ -253,8 +267,9 @@ function stepElection() {
     save.onclick = async () => {
       save.disabled = true;
       const questions = [...box.children].map((c) => ({
-        title: c.querySelector('input').value,
-        options: c.querySelector('textarea').value,
+        title: c.querySelector('.qtitle').value,
+        options: c.querySelector('.qopts').value,
+        pick: c.querySelector('.qpick').value,
       }));
       try {
         const r = await post('/api/admin/setup', {
@@ -287,7 +302,8 @@ function stepElection() {
     el('p', { className: 'kv' }, 'Votación: ', el('b', { textContent: S.election.title })),
     ...S.questions.map((q, i) => el('p', { className: 'kv' },
       `${i + 1}. `, el('b', { textContent: q.title }),
-      ' — ' + q.options.map((o) => o.label).join(' · '))),
+      (q.pick > 1 ? ` (marcar ${q.pick})` : '')
+      + ' — ' + q.options.map((o) => o.label).join(' · '))),
     el('p', { className: 'kv' }, 'Votantes: ', el('b', { textContent: String(S.voters.length) })));
 
   if (st === 'open') {
@@ -400,21 +416,25 @@ function stepResults() {
 
   const tables = S.results.map((q, i) => {
     const total = q.results.reduce((a, r) => a + r.votes, 0);
+    // Con varias marcas por papeleta, el porcentaje va sobre las papeletas.
+    const base = q.pick > 1 ? q.ballots : total;
     const max = Math.max(1, ...q.results.map((r) => r.votes));
     const table = el('table', {}, el('tr', {},
       el('th', { textContent: 'Opción' }), el('th', { textContent: 'Votos' }),
-      el('th', { textContent: '%' }), el('th', {})));
+      el('th', { textContent: q.pick > 1 ? '% papeletas' : '%' }), el('th', {})));
     for (const r of q.results) {
       const fill = el('div', { className: 'fill' });
       fill.style.width = (r.votes / max * 100) + '%';
       table.append(el('tr', {},
         el('td', { textContent: r.label }),
         el('td', { className: 'r', textContent: String(r.votes) }),
-        el('td', { className: 'r', textContent: total ? (Math.round(r.votes * 1000 / total) / 10) + '%' : '—' }),
+        el('td', { className: 'r', textContent: base ? (Math.round(r.votes * 1000 / base) / 10) + '%' : '—' }),
         el('td', {}, el('div', { className: 'track' }, fill))));
     }
     return el('div', { className: 'qres' },
-      el('label', { textContent: S.results.length > 1 ? `${i + 1}. ${q.title}` : q.title }),
+      el('label', { textContent: (S.results.length > 1 ? `${i + 1}. ` : '') + q.title }),
+      q.pick > 1 ? el('p', { className: 'hint', textContent:
+        `${q.ballots} ${q.ballots === 1 ? 'papeleta' : 'papeletas'}, cada una con ${q.pick} marcas.` }) : null,
       table);
   });
 
