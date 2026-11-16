@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Panel de la votación</title>
+<style>
+  :root{--bg:#f4f6f9;--card:#fff;--ink:#17202e;--muted:#5f6b7f;--brand:#2f5bea;
+        --line:#e2e6ee;--ok:#0f7a56;--okbg:#e6f6ef;--err:#b42318;--errbg:#fdeceb;
+        --warn:#92400e;--warnbg:#fef4e2}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  main{max-width:720px;margin:0 auto;padding:28px 16px 70px}
+  h1{font-size:1.5rem;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:.93rem}
+  .step{background:var(--card);border:1px solid var(--line);border-radius:14px;
+        padding:22px;margin-bottom:16px}
+  .step.now{border-color:var(--brand);box-shadow:0 0 0 3px rgba(47,91,234,.1)}
+  .step.done{opacity:.95}
+  .head{display:flex;align-items:center;gap:11px;margin-bottom:4px}
+  .n{width:27px;height:27px;flex:none;border-radius:50%;background:#e9edf4;color:var(--muted);
+     display:grid;place-items:center;font-weight:700;font-size:.85rem}
+  .step.now .n{background:var(--brand);color:#fff}
+  .step.done .n{background:var(--ok);color:#fff}
+  h2{font-size:1.07rem;margin:0;font-weight:650}
+  .hint{color:var(--muted);font-size:.89rem;margin:3px 0 14px}
+  label{display:block;font-weight:600;margin:14px 0 5px;font-size:.92rem}
+  input,textarea,select{width:100%;padding:10px 12px;border:1px solid #cfd6e3;
+        border-radius:9px;font:inherit;background:#fff}
+  input:focus,textarea:focus,select:focus{outline:2px solid var(--brand);outline-offset:-1px}
+  textarea{min-height:104px;resize:vertical;font-family:inherit}
+  .two{display:flex;gap:12px;flex-wrap:wrap}.two>*{flex:1;min-width:150px}
+  button{padding:10px 17px;border:0;border-radius:9px;background:var(--brand);color:#fff;
+         font:inherit;font-weight:600;cursor:pointer;margin:14px 8px 0 0}
+  button:hover:not(:disabled){background:#2449c8}
+  button.sec{background:#fff;color:var(--ink);border:1px solid #cfd6e3}
+  button.sec:hover:not(:disabled){background:#f6f8fb}
+  button.danger{background:var(--err)}button.danger:hover:not(:disabled){background:#97170f}
+  button:disabled{opacity:.45;cursor:default}
+  a.btn{display:inline-block;padding:10px 17px;border-radius:9px;background:#fff;color:var(--ink);
+        border:1px solid #cfd6e3;text-decoration:none;font-weight:600;margin:14px 8px 0 0}
+  .badge{display:inline-block;padding:2px 11px;border-radius:20px;font-size:.82rem;font-weight:700}
+  .b-draft{background:#eef1f6;color:var(--muted)}
+  .b-open{background:var(--okbg);color:var(--ok)}
+  .b-closed{background:#ede9fe;color:#5b21b6}
+  .note{padding:12px 14px;border-radius:9px;background:#eef1f6;font-size:.9rem;margin-top:12px}
+  .note.ok{background:var(--okbg);color:var(--ok)}
+  .note.err{background:var(--errbg);color:var(--err)}
+  .note.warn{background:var(--warnbg);color:var(--warn)}
+  table{width:100%;border-collapse:collapse;margin-top:12px;font-size:.93rem}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid #eef1f5}
+  th{font-size:.8rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  td.r{text-align:right;white-space:nowrap}
+  .track{height:9px;background:#e9edf4;border-radius:5px;overflow:hidden;min-width:70px}
+  .fill{height:100%;background:var(--brand)}
+  .scroll{max-height:290px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:9px}
+  .kv{font-size:.93rem;color:var(--muted);margin:2px 0}
+  .kv b{color:var(--ink);font-weight:650}
+  code{background:#eef1f6;padding:1px 6px;border-radius:5px;font-size:.88em;word-break:break-all}
+  summary{cursor:pointer;color:var(--muted);font-size:.9rem;padding:4px 0}
+  summary:hover{color:var(--brand)}
+  details[open] summary{margin-bottom:6px}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid #c7d2fe;
+        border-top-color:var(--brand);border-radius:50%;animation:s .7s linear infinite;
+        vertical-align:-2px;margin-right:7px}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Panel de la votación</h1>
+  <p class="sub" id="sub"></p>
+  <div id="steps"></div>
+</main>
+<script>
+'use strict';
+const LABEL = { draft: 'Sin abrir', open: 'Abierta', closed: 'Cerrada' };
+let S = null, polling = false;
+
+function el(tag, props, ...kids) {
+  const n = Object.assign(document.createElement(tag), props || {});
+  for (const k of kids.flat()) if (k != null) n.append(k);
+  return n;
+}
+const note = (t, k) => el('div', { className: 'note ' + (k || ''), textContent: t });
+
+// get y post separados a propósito: con una sola función era fácil enviar
+// GET sin cuerpo por descuido y recibir un 404.
+async function req(url, method, body) {
+  const r = await fetch(url, method === 'GET' ? undefined : {
+    method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || 'Ocurrió un error.');
+  return d;
+}
+const get = (url) => req(url, 'GET');
+const post = (url, body) => req(url, 'POST', body);
+
+// Aviso que debe seguir visible después de recargar el panel.
+let flash = null;
+const setFlash = (step, text, kind) => { flash = { step, text, kind }; };
+const flashFor = (n) => (flash && flash.step === n ? note(flash.text, flash.kind) : null);
+
+function step(n, title, hint, state, ...body) {
+  return el('section', { className: 'step ' + state },
+    el('div', { className: 'head' },
+      el('div', { className: 'n', textContent: state === 'done' ? '✓' : String(n) }),
+      el('h2', { textContent: title })),
+    hint ? el('p', { className: 'hint', textContent: hint }) : null,
+    body, flashFor(n));
+}
+
+// ------------------------------------------------------- 1. correo
+function stepMail() {
+  const m = S.mail;
+  const ready = (m.provider === 'brevo' && m.has_brevo_key && m.from_email)
+             || (m.provider === 'smtp' && m.smtp_host);
+  const out = el('div');
+
+  const provider = el('select', {}, ...[
+    ['brevo', 'Brevo (recomendado, funciona en Render gratis)'],
+    ['smtp', 'Servidor SMTP propio'],
+    ['test', 'Modo prueba (no envía correos)'],
+  ].map(([v, t]) => el('option', { value: v, textContent: t, selected: (m.provider || 'brevo') === v })));
+
+  const fromEmail = el('input', { type: 'email', value: m.from_email, placeholder: 'votacion@tucorreo.com' });
+  const fromName = el('input', { value: m.from_name || 'Votación', placeholder: 'Comité electoral' });
+  const brevoKey = el('input', { type: 'password', placeholder: m.has_brevo_key ? '•••••• (ya guardada, deja vacío para no cambiarla)' : 'xkeysib-...' });
+  const host = el('input', { value: m.smtp_host, placeholder: 'smtp.midominio.com' });
+  const port = el('input', { value: m.smtp_port || '587', placeholder: '587' });
+  const user = el('input', { value: m.smtp_user, placeholder: 'usuario' });
+  const pass = el('input', { type: 'password', placeholder: m.has_smtp_pass ? '•••••• (ya guardada)' : 'contraseña' });
+
+  const boxBrevo = el('div', {}, el('label', { textContent: 'Clave de API de Brevo' }), brevoKey,
+    el('p', { className: 'hint' }, 'En Brevo: ', el('b', { textContent: 'Settings → API Keys → Generate a new API key' }), '. Empieza por xkeysib-'));
+  const boxSmtp = el('div', {},
+    el('label', { textContent: 'Servidor' }), host,
+    el('div', { className: 'two' },
+      el('div', {}, el('label', { textContent: 'Puerto' }), port),
+      el('div', {}, el('label', { textContent: 'Usuario' }), user)),
+    el('label', { textContent: 'Contraseña' }), pass,
+    note('El plan gratuito de Render bloquea los puertos SMTP. Esta opción solo sirve si pagas una instancia o si alojas la app en otro servidor.', 'warn'));
+
+  const sync = () => {
+    boxBrevo.hidden = provider.value !== 'brevo';
+    boxSmtp.hidden = provider.value !== 'smtp';
+  };
+  provider.onchange = sync;
+
+  const save = el('button', { textContent: 'Guardar configuración' });
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      await post('/api/admin/mail', {
+        provider: provider.value, from_email: fromEmail.value, from_name: fromName.value,
+        brevo_key: brevoKey.value, smtp_host: host.value, smtp_port: port.value,
+        smtp_user: user.value, smtp_pass: pass.value,
+      });
+      setFlash(1, 'Configuración guardada. Ahora envía un correo de prueba.', 'ok');
+      await load();
+      return;
+    } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+    save.disabled = false;
+  };
+
+  const testTo = el('input', { type: 'email', placeholder: 'tu@correo.com' });
+  const test = el('button', { className: 'sec', textContent: 'Enviar correo de prueba' });
+  test.onclick = async () => {
+    test.disabled = true;
+    out.replaceChildren(note('Enviando…'));
+    try {
+      const r = await post('/api/admin/mail-test', { to: testTo.value });
+      out.replaceChildren(r.test
+        ? note('Estás en modo prueba: no se envió nada. El enlace aparece en los registros del servidor (en Render: pestaña Logs).', 'warn')
+        : note('Correo enviado. Revisa tu bandeja de entrada y la carpeta de spam. Si llegó, el correo está listo.', 'ok'));
+    } catch (e) {
+      out.replaceChildren(note('No se pudo enviar: ' + e.message, 'err'));
+    }
+    test.disabled = false;
+  };
+
+  const body = el('div', {},
+    el('label', { textContent: 'Cómo se envían los correos' }), provider,
+    boxBrevo, boxSmtp,
+    el('div', { className: 'two' },
+      el('div', {}, el('label', { textContent: 'Correo del remitente' }), fromEmail),
+      el('div', {}, el('label', { textContent: 'Nombre del remitente' }), fromName)),
+    el('p', { className: 'hint', textContent: 'Con Brevo, el correo del remitente debe estar verificado en Brevo (Settings → Senders). Te llega un correo de confirmación con un clic.' }),
+    save,
+    el('hr', { style: 'border:0;border-top:1px solid var(--line);margin:22px 0' }),
+    el('label', { textContent: 'Probar el envío' }), testTo, test, out);
+
+  sync();
+  if (!ready)
+    return step(1, 'Configurar el envío de correos',
+      'Solo se hace una vez. Sin esto, los votantes no reciben su enlace.', 'now', body);
+
+  // Ya configurado: se pliega para no estorbar el día de la votación.
+  const how = m.provider === 'brevo' ? 'Brevo' : 'servidor SMTP propio';
+  return step(1, 'Envío de correos configurado', '', 'done',
+    el('details', { open: !!(flash && flash.step === 1) }, // abierto justo después de guardar
+      el('summary', { textContent: `Se envía con ${how}, desde ${m.from_email || m.smtp_user}. Pulsa para cambiarlo o volver a probarlo.` }),
+      body));
+}
+
+// ------------------------------------------------------- 2. votación
+function stepElection() {
+  const st = S.election.status;
+  const out = el('div');
+
+  if (st === 'draft') {
+    const title = el('input', { value: S.election.title, placeholder: '¿Aprobamos el presupuesto 2027?' });
+    const desc = el('input', { value: S.election.description, placeholder: 'Asamblea ordinaria del 3 de diciembre' });
+    const options = el('textarea', { value: S.results.map((r) => r.label).join('\n'), placeholder: 'Sí\nNo\nAbstención' });
+    const emails = el('textarea', { value: S.voters.map((v) => v.email).join('\n'), placeholder: 'ana@correo.com\nluis@correo.com' });
+    const save = el('button', { textContent: 'Guardar votación' });
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        const r = await post('/api/admin/setup', {
+          title: title.value, description: desc.value,
+          options: options.value, emails: emails.value,
+        });
+        setFlash(2, `Guardado: ${r.options} opciones y ${r.voters} votantes`
+          + (r.duplicates ? `. Se ignoraron ${r.duplicates} correos repetidos.` : '.'), 'ok');
+        await load();
+        return;
+      } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+      save.disabled = false;
+    };
+    const body = el('div', {},
+      el('label', { textContent: 'Pregunta' }), title,
+      el('label', { textContent: 'Descripción (opcional)' }), desc,
+      el('label', { textContent: 'Opciones, una por línea' }), options,
+      el('label', { textContent: 'Correos de los votantes' }), emails,
+      el('p', { className: 'hint', textContent: 'Pega la lista tal como la tengas: una por línea, separadas por comas o copiada de Excel. Los repetidos se descartan solos.' }),
+      save, out);
+    const done = S.results.length >= 2 && S.voters.length > 0;
+    return step(2, 'Crear la votación', 'Revísala bien: al abrirla ya no podrás cambiarla.',
+      done ? 'done' : (S.mail.provider ? 'now' : ''), body);
+  }
+
+  // Ya abierta o cerrada: resumen y añadir votantes rezagados.
+  const info = el('div', {},
+    el('p', { className: 'kv' }, 'Pregunta: ', el('b', { textContent: S.election.title })),
+    el('p', { className: 'kv' }, 'Opciones: ', el('b', { textContent: S.results.map((r) => r.label).join(' · ') })),
+    el('p', { className: 'kv' }, 'Votantes: ', el('b', { textContent: String(S.voters.length) })));
+
+  if (st === 'open') {
+    const add = el('textarea', { placeholder: 'rezagado@correo.com' });
+    const btn = el('button', { className: 'sec', textContent: 'Añadir a la lista' });
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const r = await post('/api/admin/voters-add', { emails: add.value });
+        setFlash(2, `${r.added} votantes añadidos`
+          + (r.ignored ? `, ${r.ignored} ya estaban en la lista.` : '.')
+          + ' Ahora envía las invitaciones pendientes en el paso 3.', 'ok');
+        await load();
+        return;
+      } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+      btn.disabled = false;
+    };
+    info.append(el('label', { textContent: 'Añadir votantes olvidados' }), add,
+      el('p', { className: 'hint', textContent: 'Los votos ya emitidos no se pierden.' }), btn, out);
+  }
+  return step(2, 'La votación', '', 'done', info);
+}
+
+// ------------------------------------------------------- 3. invitaciones
+function stepInvites() {
+  const st = S.election.status;
+  const out = el('div');
+  const ready = S.results.length >= 2 && S.voters.length > 0;
+
+  if (st === 'draft') {
+    const open = el('button', { textContent: 'Abrir votación y enviar invitaciones', disabled: !ready });
+    open.onclick = async () => {
+      if (!confirm('Se abrirá la votación y se enviará un correo a cada votante. '
+        + 'Ya no podrás cambiar la pregunta ni las opciones. ¿Continuar?')) return;
+      open.disabled = true;
+      try { await post('/api/admin/open', { invite: true }); await load(); startPolling(); return; }
+      catch (e) { out.replaceChildren(note(e.message, 'err')); open.disabled = false; }
+    };
+    const only = el('button', { className: 'sec', textContent: 'Solo abrir, sin enviar', disabled: !ready });
+    only.onclick = async () => {
+      only.disabled = true;
+      try {
+        await post('/api/admin/open');
+        setFlash(3, 'Votación abierta. Nadie ha recibido su enlace todavía: envía las invitaciones cuando quieras.', 'warn');
+        await load();
+        return;
+      } catch (e) { out.replaceChildren(note(e.message, 'err')); only.disabled = false; }
+    };
+    return step(3, 'Abrir e invitar',
+      ready ? 'Cada votante recibirá un correo con su enlace personal.' : 'Primero completa el paso 2.',
+      ready ? 'now' : '', open, only, out);
+  }
+
+  if (st === 'closed') return step(3, 'Invitaciones enviadas', '', 'done',
+    el('p', { className: 'kv' }, 'Participación final: ',
+      el('b', { textContent: `${S.voters.filter((v) => v.voted).length} de ${S.voters.length}` })));
+
+  // Abierta
+  const pending = S.voters.filter((v) => !v.invited && !v.voted).length;
+  const j = S.job;
+  const body = el('div', {});
+
+  if (j.running) {
+    body.append(el('div', { className: 'note' },
+      el('span', { className: 'spin' }),
+      `Enviando invitaciones… ${j.sent} de ${j.total}`));
+  } else if (j.total) {
+    body.append(note(`Último envío: ${j.sent} de ${j.total} correos enviados`
+      + (j.failed.length ? `, ${j.failed.length} fallaron.` : ' sin errores.'),
+      j.failed.length ? 'warn' : 'ok'));
+    if (j.failed.length) {
+      const t = el('table', {}, el('tr', {}, el('th', { textContent: 'Correo' }), el('th', { textContent: 'Motivo' })));
+      for (const f of j.failed.slice(0, 40))
+        t.append(el('tr', {}, el('td', { textContent: f.email }), el('td', { textContent: f.error })));
+      body.append(el('div', { className: 'scroll' }, t));
+    }
+  }
+
+  const send = el('button', {
+    textContent: pending ? `Enviar a los ${pending} pendientes` : 'No hay invitaciones pendientes',
+    disabled: j.running || !pending,
+  });
+  send.onclick = async () => {
+    send.disabled = true;
+    try { await post('/api/admin/invite'); startPolling(); } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+  };
+  const resend = el('button', { className: 'sec', textContent: 'Reenviar a todos los que no han votado', disabled: j.running });
+  resend.onclick = async () => {
+    if (!confirm('Se enviará un enlace nuevo a todos los que aún no han votado. '
+      + 'Los enlaces anteriores dejarán de funcionar. ¿Continuar?')) return;
+    resend.disabled = true;
+    try { await post('/api/admin/invite', { all: true }); startPolling(); } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+  };
+
+  body.append(send, resend,
+    el('a', { className: 'btn', href: '/api/admin/links.csv', textContent: 'Descargar enlaces (CSV)' }),
+    el('p', { className: 'hint', textContent: 'El CSV es el plan B: si los correos no llegan, reparte los enlaces por WhatsApp o impresos. Descargarlo genera enlaces nuevos y anula los anteriores de quienes no han votado.' }),
+    el('p', { className: 'kv' }, 'Página para los votantes: ', el('code', { textContent: S.baseUrl })),
+    out);
+  return step(3, 'Invitaciones', '', pending ? 'now' : 'done', body);
+}
+
+// ------------------------------------------------------- 4. resultados
+function stepResults() {
+  const st = S.election.status;
+  if (st === 'draft') return step(4, 'Resultados', 'Aparecerán cuando la votación esté abierta.', '');
+
+  const voted = S.voters.filter((v) => v.voted).length;
+  const total = S.results.reduce((a, r) => a + r.votes, 0);
+  const max = Math.max(1, ...S.results.map((r) => r.votes));
+  const out = el('div');
+
+  const table = el('table', {}, el('tr', {},
+    el('th', { textContent: 'Opción' }), el('th', { textContent: 'Votos' }),
+    el('th', { textContent: '%' }), el('th', {})));
+  for (const r of S.results) {
+    const fill = el('div', { className: 'fill' });
+    fill.style.width = (r.votes / max * 100) + '%';
+    table.append(el('tr', {},
+      el('td', { textContent: r.label }),
+      el('td', { className: 'r', textContent: String(r.votes) }),
+      el('td', { className: 'r', textContent: total ? (Math.round(r.votes * 1000 / total) / 10) + '%' : '—' }),
+      el('td', {}, el('div', { className: 'track' }, fill))));
+  }
+
+  const body = el('div', {},
+    el('p', { className: 'kv' }, 'Participación: ',
+      el('b', { textContent: `${voted} de ${S.voters.length}` }),
+      total ? ` · ${total} ${total === 1 ? 'voto contado' : 'votos contados'}` : ''),
+    table);
+
+  if (st === 'open') {
+    body.append(note('Solo tú ves este conteo. Los votantes lo verán cuando cierres la votación.', 'warn'));
+    const close = el('button', { className: 'danger', textContent: 'Cerrar votación y publicar resultados' });
+    close.onclick = async () => {
+      if (!confirm('Se cierra la votación definitivamente. Quien no haya votado ya no podrá hacerlo '
+        + 'y los resultados quedarán visibles para todos. ¿Continuar?')) return;
+      close.disabled = true;
+      try {
+        await post('/api/admin/close');
+        await load();
+        return;
+      } catch (e) { out.replaceChildren(note(e.message, 'err')); close.disabled = false; }
+    };
+    body.append(close);
+  } else {
+    body.append(note('Votación cerrada. Los resultados ya son públicos en la página de votación.', 'ok'));
+  }
+
+  const list = el('table', {}, el('tr', {},
+    el('th', { textContent: 'Votante' }), el('th', { textContent: 'Estado' })));
+  for (const v of S.voters)
+    list.append(el('tr', {},
+      el('td', { textContent: v.email }),
+      el('td', { textContent: v.voted ? '✓ votó' : (v.invited ? 'invitado, sin votar' : 'sin invitar') })));
+  body.append(el('label', { textContent: 'Quién ha votado' }),
+    el('p', { className: 'hint', textContent: 'Se registra quién votó, pero no qué votó: las dos cosas se guardan por separado.' }),
+    el('div', { className: 'scroll' }, list), out);
+
+  return step(4, st === 'open' ? 'Seguimiento y cierre' : 'Resultados finales', '', st === 'closed' ? 'done' : 'now', body);
+}
+
+// ------------------------------------------------------- zona de riesgo
+function stepReset() {
+  const out = el('div');
+  const btn = el('button', { className: 'danger sec', textContent: 'Reiniciar y empezar de cero' });
+  btn.onclick = async () => {
+    if (!confirm('Se borran la pregunta, las opciones, los votantes y TODOS los votos. '
+      + 'Esto no se puede deshacer. ¿Continuar?')) return;
+    if (prompt('Para confirmar, escribe BORRAR') !== 'BORRAR') return;
+    try { await post('/api/admin/reset'); await load(); }
+    catch (e) { out.replaceChildren(note(e.message, 'err')); }
+  };
+  return el('section', { className: 'step' },
+    el('h2', { textContent: 'Zona de riesgo' }),
+    el('p', { className: 'hint', textContent: 'Úsalo solo para hacer pruebas antes de la votación real.' }),
+    btn, out);
+}
+
+// ------------------------------------------------------- render + polling
+function render() {
+  document.getElementById('sub').replaceChildren(
+    el('span', { className: 'badge b-' + S.election.status, textContent: LABEL[S.election.status] }),
+    ' ', S.election.title || 'Sin configurar');
+  document.getElementById('steps').replaceChildren(
+    stepMail(), stepElection(), stepInvites(), stepResults(), stepReset());
+  flash = null; // Se muestra una sola vez.
+}
+async function load() {
+  S = await get('/api/admin/state');
+  render();
+  if (S.job.running) startPolling();
+}
+function startPolling() {
+  if (polling) return;
+  polling = true;
+  const tick = async () => {
+    try { S = await get('/api/admin/state'); render(); } catch {}
+    if (S && S.job.running) setTimeout(tick, 2000);
+    else polling = false;
+  };
+  setTimeout(tick, 1200);
+}
+load().catch((e) => { document.getElementById('steps').replaceChildren(note(e.message, 'err')); });
+</script>
+</body>
+</html>

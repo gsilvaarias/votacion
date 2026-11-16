@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Votación</title>
+<style>
+  :root{--bg:#f4f6f9;--card:#fff;--ink:#17202e;--muted:#5f6b7f;--brand:#2f5bea;
+        --line:#e2e6ee;--ok:#0f7a56;--okbg:#e6f6ef;--err:#b42318;--errbg:#fdeceb}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  main{max-width:560px;margin:0 auto;padding:40px 16px 60px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+        padding:30px 26px;box-shadow:0 1px 3px rgba(16,24,40,.05)}
+  h1{margin:0 0 8px;font-size:1.45rem;line-height:1.3}
+  .desc{color:var(--muted);margin:0 0 22px}
+  label.opt{display:flex;gap:13px;align-items:center;padding:15px 16px;margin-bottom:10px;
+            border:1.5px solid var(--line);border-radius:11px;cursor:pointer;transition:.12s}
+  label.opt:hover{border-color:#b9c4dc}
+  label.opt:has(input:checked){border-color:var(--brand);background:#eef2ff;font-weight:600}
+  label.opt input{width:19px;height:19px;accent-color:var(--brand);flex:none;margin:0}
+  input[type=email]{width:100%;padding:13px;border:1px solid #cfd6e3;border-radius:10px;
+                    font:inherit;margin-bottom:12px}
+  input[type=email]:focus{outline:2px solid var(--brand);outline-offset:-1px;border-color:var(--brand)}
+  button{width:100%;padding:14px;border:0;border-radius:10px;background:var(--brand);
+         color:#fff;font:inherit;font-weight:600;cursor:pointer;margin-top:6px}
+  button:hover:not(:disabled){background:#2449c8}
+  button:disabled{opacity:.45;cursor:default}
+  .msg{margin-top:16px;padding:13px 15px;border-radius:10px;background:#eef1f6;font-size:.95rem}
+  .msg.ok{background:var(--okbg);color:var(--ok)} .msg.err{background:var(--errbg);color:var(--err)}
+  .bar{margin-bottom:16px}
+  .bar .row{display:flex;justify-content:space-between;gap:12px;font-size:.96rem}
+  .bar .name{font-weight:600} .bar .num{color:var(--muted);flex:none}
+  .track{height:11px;background:#e9edf4;border-radius:6px;overflow:hidden;margin-top:5px}
+  .fill{height:100%;background:var(--brand);border-radius:6px}
+  .big{font-size:2.6rem;line-height:1;margin:0 0 14px}
+  .foot{text-align:center;color:var(--muted);font-size:.87rem;margin-top:22px}
+</style>
+</head>
+<body>
+<main><div class="card" id="app"><p class="desc">Cargando…</p></div></main>
+<script>
+'use strict';
+const app = document.getElementById('app');
+const params = new URLSearchParams(location.search);
+const token = params.get('t');
+
+function el(tag, props, ...kids) {
+  const n = Object.assign(document.createElement(tag), props || {});
+  for (const k of kids.flat()) if (k != null) n.append(k);
+  return n;
+}
+function msg(text, kind) { return el('div', { className: 'msg ' + (kind || ''), textContent: text }); }
+function show(...nodes) { app.replaceChildren(...nodes.flat().filter(Boolean)); }
+
+async function api(url, body) {
+  // body === undefined -> GET. Un objeto vacío también se envía como POST.
+  const r = await fetch(url, body === undefined ? undefined
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'Ocurrió un error. Intenta de nuevo.');
+  return data;
+}
+
+// ---------- pantallas ----------
+function screenClosed(e) {
+  const total = e.results.reduce((s, r) => s + r.votes, 0);
+  const max = Math.max(1, ...e.results.map((r) => r.votes));
+  const bars = e.results.map((r) => {
+    const pct = total ? Math.round(r.votes * 1000 / total) / 10 : 0;
+    const fill = el('div', { className: 'fill' });
+    fill.style.width = (r.votes / max * 100) + '%';
+    return el('div', { className: 'bar' },
+      el('div', { className: 'row' },
+        el('span', { className: 'name', textContent: r.label }),
+        el('span', { className: 'num', textContent: `${r.votes} · ${pct}%` })),
+      el('div', { className: 'track' }, fill));
+  });
+  show(el('h1', { textContent: e.title }),
+    el('p', { className: 'desc', textContent: `Votación cerrada · ${total} ${total === 1 ? 'voto' : 'votos'} en total` }),
+    bars);
+}
+
+function screenRequest(e, notice) {
+  const input = el('input', { type: 'email', placeholder: 'tu@correo.com', required: true, autocomplete: 'email' });
+  const btn = el('button', { type: 'submit', textContent: 'Enviarme mi enlace para votar' });
+  const out = el('div');
+  const form = el('form', {}, input, btn, out);
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    btn.disabled = true;
+    try {
+      const r = await api('/api/request-link', { email: input.value });
+      out.replaceChildren(msg(r.message, 'ok'));
+    } catch (err) {
+      out.replaceChildren(msg(err.message, 'err'));
+      btn.disabled = false;
+      return;
+    }
+    setTimeout(() => { btn.disabled = false; }, 8000);
+  };
+  show(el('h1', { textContent: e.title || 'Votación' }),
+    el('p', { className: 'desc', textContent: e.description || 'Escribe el correo con el que estás registrado y te enviaremos tu enlace personal para votar.' }),
+    notice ? msg(notice, 'err') : null,
+    form);
+}
+
+async function screenBallot() {
+  const b = await api('/api/ballot?t=' + encodeURIComponent(token));
+  let chosen = null;
+  const btn = el('button', { textContent: 'Emitir mi voto', disabled: true });
+  const out = el('div');
+  const opts = b.options.map((o) => {
+    const radio = el('input', { type: 'radio', name: 'opcion', value: String(o.id) });
+    radio.onchange = () => { chosen = o.id; btn.disabled = false; };
+    return el('label', { className: 'opt' }, radio, el('span', { textContent: o.label }));
+  });
+  btn.onclick = async () => {
+    if (!confirm('Tu voto es definitivo y no se puede cambiar. ¿Confirmas?')) return;
+    btn.disabled = true;
+    out.replaceChildren();
+    try {
+      await api('/api/vote', { token, optionId: chosen });
+      history.replaceState(null, '', '/');
+      show(el('p', { className: 'big', textContent: '✓' }),
+        el('h1', { textContent: 'Voto registrado' }),
+        msg('Gracias por participar. Tu voto quedó guardado de forma secreta, sin vínculo con tu nombre ni tu correo.', 'ok'),
+        el('p', { className: 'foot', textContent: 'Ya puedes cerrar esta página.' }));
+    } catch (err) {
+      out.replaceChildren(msg(err.message, 'err'));
+      btn.disabled = false;
+    }
+  };
+  show(el('h1', { textContent: b.title }),
+    b.description ? el('p', { className: 'desc', textContent: b.description }) : null,
+    opts, btn, out,
+    el('p', { className: 'foot', textContent: 'Puedes votar una sola vez.' }));
+}
+
+async function main() {
+  try {
+    if (token) {
+      try {
+        await screenBallot();
+        return;
+      } catch (err) {
+        // Enlace vencido, ya usado o votación cerrada: mostramos la página normal
+        // con el aviso, en vez de dejar al votante en un callejón sin salida.
+        const e = await api('/api/election');
+        if (e.status === 'closed') return screenClosed(e);
+        if (e.status === 'open') return screenRequest(e, err.message + ' Si ya votaste, no necesitas hacer nada más.');
+        return show(el('h1', { textContent: e.title || 'Votación' }), msg(err.message, 'err'));
+      }
+    }
+    const e = await api('/api/election');
+    if (e.status === 'closed') return screenClosed(e);
+    if (e.status === 'draft')
+      return show(el('h1', { textContent: 'Votación' }),
+        msg('La votación todavía no ha comenzado. Vuelve más tarde.'));
+    screenRequest(e);
+  } catch (err) {
+    show(el('h1', { textContent: 'Votación' }), msg(err.message, 'err'));
+  }
+}
+main();
+</script>
+</body>
+</html>

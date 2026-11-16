@@ -1,0 +1,27 @@
+# Plano de infraestructura para Render.
+# Al crear un "Blueprint" apuntando a este repositorio, Render crea
+# automáticamente la base de datos y el servidor web, y los conecta.
+# Lo único que te pedirá escribir es ADMIN_PASSWORD.
+
+databases:
+  - name: votacion-db
+    databaseName: votacion
+    plan: free # Gratis, 1 GB. ATENCIÓN: expira 30 días después de crearse.
+
+services:
+  - type: web
+    name: votacion
+    runtime: node
+    plan: free # Gratis. Se duerme tras 15 min sin visitas (tarda ~1 min en despertar).
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: votacion-db
+          property: connectionString
+      - key: ADMIN_PASSWORD
+        sync: false # Render te lo pregunta al desplegar.
+      - key: NODE_VERSION
+        value: "22"

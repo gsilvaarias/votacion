@@ -1,0 +1,481 @@
+/**
+ * App de votación interna.
+ * - Lista cerrada de votantes identificados por correo.
+ * - Cada votante recibe un enlace personal de un solo uso.
+ * - El voto se guarda sin vínculo con el votante (voto secreto).
+ *
+ * Variables de entorno: DATABASE_URL y ADMIN_PASSWORD (obligatorias).
+ * El envío de correo se configura desde el panel /admin.
+ */
+const express = require('express');
+const { Pool } = require('pg');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const path = require('path');
+
+const PORT = process.env.PORT || 3000;
+const { DATABASE_URL, ADMIN_PASSWORD } = process.env;
+// Render inyecta RENDER_EXTERNAL_URL automáticamente; BASE_URL solo se usa
+// si quieres forzar otro valor (por ejemplo un dominio propio).
+const BASE_URL = (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`)
+  .replace(/\/+$/, '');
+// Punto final de la API de Brevo. Se puede sobrescribir para pruebas.
+const BREVO_URL = process.env.BREVO_URL || 'https://api.brevo.com/v3/smtp/email';
+
+if (!DATABASE_URL || !ADMIN_PASSWORD) {
+  console.error('ERROR: faltan las variables DATABASE_URL y/o ADMIN_PASSWORD.');
+  process.exit(1);
+}
+
+const isLocal = /@(localhost|127\.0\.0\.1)/.test(DATABASE_URL);
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: isLocal ? false : { rejectUnauthorized: false },
+  max: 5,
+});
+
+// ---------------------------------------------------------------- utilidades
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+/** Extrae correos de un texto pegado desde Excel, Word o un correo.
+ *  Tolera saltos de línea, comas, punto y coma, tabulaciones y "Nombre <correo>". */
+function parseEmails(text) {
+  const found = String(text || '').match(EMAIL_RE) || [];
+  const seen = new Set(); const list = [];
+  for (const raw of found) {
+    const e = raw.toLowerCase();
+    if (!seen.has(e)) { seen.add(e); list.push(e); }
+  }
+  return { emails: list, duplicates: found.length - list.length };
+}
+
+// ---------------------------------------------------------- base de datos
+async function init() {
+  await pool.query(`
+    create table if not exists settings(
+      key text primary key,
+      value text not null default '');
+    create table if not exists election(
+      id int primary key default 1 check (id = 1),
+      title text not null default '',
+      description text not null default '',
+      status text not null default 'draft');
+    create table if not exists options(
+      id serial primary key,
+      label text not null,
+      position int not null);
+    create table if not exists voters(
+      id serial primary key,
+      email text unique not null,
+      token_hash text,
+      last_sent timestamptz,
+      invited_at timestamptz,
+      voted boolean not null default false);
+    create table if not exists votes(
+      id serial primary key,
+      option_id int not null references options(id) on delete cascade);
+    insert into election(id) values (1) on conflict do nothing;
+  `);
+  // Compatibilidad con bases creadas por la versión 1.
+  await pool.query(`alter table voters add column if not exists invited_at timestamptz`);
+}
+
+const getSettings = async () => {
+  const { rows } = await pool.query('select key, value from settings');
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+};
+const setSettings = async (obj) => {
+  for (const [k, v] of Object.entries(obj))
+    await pool.query(
+      `insert into settings(key, value) values ($1, $2)
+       on conflict (key) do update set value = excluded.value`, [k, String(v ?? '')]);
+};
+const getElection = async () => {
+  const { rows: [el] } = await pool.query('select title, description, status from election where id = 1');
+  return el;
+};
+const tally = async () => {
+  const { rows } = await pool.query(`
+    select o.label, count(v.id)::int as votes
+    from options o left join votes v on v.option_id = o.id
+    group by o.id, o.label, o.position order by o.position`);
+  return rows;
+};
+
+// ------------------------------------------------------------------- correo
+/** Envía un correo. Lanza un Error con mensaje legible si falla. */
+async function sendMail(to, subject, html, text) {
+  const s = await getSettings();
+  const fromEmail = s.from_email || '';
+  const fromName = s.from_name || 'Votación';
+
+  if (s.provider === 'brevo') {
+    if (!s.brevo_key) throw new Error('Falta la clave de API de Brevo.');
+    if (!fromEmail) throw new Error('Falta el correo del remitente.');
+    const r = await fetch(BREVO_URL, {
+      method: 'POST',
+      headers: { 'api-key': s.brevo_key, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { email: fromEmail, name: fromName },
+        to: [{ email: to }],
+        subject, htmlContent: html, textContent: text,
+      }),
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      let msg = body.slice(0, 300);
+      try { const j = JSON.parse(body); msg = j.message || msg; } catch {}
+      if (r.status === 401) msg = 'Clave de API rechazada por Brevo. Revisa que la copiaste completa.';
+      if (/sender/i.test(msg)) msg = `Brevo no acepta el remitente "${fromEmail}". Verifícalo en Brevo: Settings → Senders.`;
+      throw new Error(`Brevo respondió ${r.status}: ${msg}`);
+    }
+    return;
+  }
+
+  if (s.provider === 'smtp') {
+    if (!s.smtp_host) throw new Error('Falta el servidor SMTP.');
+    const port = +(s.smtp_port || 587);
+    const t = nodemailer.createTransport({
+      host: s.smtp_host, port, secure: port === 465,
+      auth: s.smtp_user ? { user: s.smtp_user, pass: s.smtp_pass } : undefined,
+      connectionTimeout: 20000, greetingTimeout: 20000,
+    });
+    try {
+      await t.sendMail({ from: `"${fromName}" <${fromEmail || s.smtp_user}>`, to, subject, html, text });
+    } catch (e) {
+      if (/ETIMEDOUT|ECONNREFUSED|ENETUNREACH/i.test(e.code || e.message))
+        throw new Error('No se pudo conectar al servidor SMTP. Si estás en el plan gratuito de Render, '
+          + 'los puertos SMTP están bloqueados: usa la opción Brevo.');
+      throw new Error(e.message);
+    } finally { t.close(); }
+    return;
+  }
+
+  // Modo prueba: no envía nada, solo registra en la consola del servidor.
+  console.log(`[MODO PRUEBA] Para: ${to} | ${subject}\n${text}`);
+}
+
+function inviteBody(title, link) {
+  const text = `Tienes derecho a voto en: ${title}\n\n`
+    + `Abre este enlace personal para votar (funciona una sola vez):\n${link}\n\n`
+    + `No compartas este enlace con nadie.`;
+  const html = `<div style="font-family:system-ui,Arial,sans-serif;font-size:16px;line-height:1.6;color:#1c2230">
+    <p>Tienes derecho a voto en:</p>
+    <p style="font-size:19px;font-weight:700">${esc(title)}</p>
+    <p>Pulsa el botón para votar. El enlace es personal y funciona una sola vez.</p>
+    <p style="margin:26px 0"><a href="${esc(link)}"
+      style="background:#2f5bea;color:#fff;padding:13px 26px;border-radius:8px;
+      text-decoration:none;font-weight:600;display:inline-block">Votar ahora</a></p>
+    <p style="font-size:13px;color:#667085">Si el botón no funciona, copia esta dirección:<br>
+      <span style="word-break:break-all">${esc(link)}</span></p>
+    <p style="font-size:13px;color:#667085">No compartas este enlace con nadie.</p>
+  </div>`;
+  return { text, html };
+}
+
+/** Genera un token nuevo para un votante y devuelve su enlace personal. */
+async function issueLink(voterId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await pool.query('update voters set token_hash = $1, last_sent = now() where id = $2', [sha(token), voterId]);
+  return `${BASE_URL}/?t=${token}`;
+}
+
+// ------------------------------------------------- trabajo de envío masivo
+let job = { running: false, total: 0, sent: 0, failed: [], finishedAt: null };
+
+async function runInvitations(onlyPending) {
+  if (job.running) return;
+  const { rows: voters } = await pool.query(
+    `select id, email from voters
+     where voted = false ${onlyPending ? 'and invited_at is null' : ''}
+     order by id`);
+  job = { running: true, total: voters.length, sent: 0, failed: [], finishedAt: null };
+  const { title } = await getElection();
+  for (const v of voters) {
+    try {
+      const link = await issueLink(v.id);
+      const { text, html } = inviteBody(title, link);
+      await sendMail(v.email, `Tu enlace para votar: ${title}`, html, text);
+      await pool.query('update voters set invited_at = now() where id = $1', [v.id]);
+      job.sent++;
+    } catch (e) {
+      job.failed.push({ email: v.email, error: e.message });
+    }
+    await sleep(300); // Respeta el límite de 300 peticiones/minuto de Brevo.
+  }
+  job.running = false;
+  job.finishedAt = new Date().toISOString();
+}
+
+// ---------------------------------------------------------------- servidor
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '2mb' }));
+
+// Límite de peticiones por IP. Generoso a propósito: en una asamblea todos
+// los votantes pueden compartir la misma IP (una sola red wifi).
+const hits = new Map();
+const limit = (max, windowMs) => (req, res, next) => {
+  const key = `${req.ip}|${req.path}`, now = Date.now();
+  const arr = (hits.get(key) || []).filter((t) => now - t < windowMs);
+  if (arr.length >= max) return res.status(429).json({ error: 'Demasiadas peticiones. Espera unos minutos.' });
+  arr.push(now); hits.set(key, arr); next();
+};
+setInterval(() => hits.clear(), 3600_000).unref();
+
+app.get('/health', (_req, res) => res.type('text').send('ok'));
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
+// ------------------------------------------------------------------ público
+app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+
+app.get('/api/election', async (_req, res) => {
+  const el = await getElection();
+  const out = { title: el.title, description: el.description, status: el.status };
+  if (el.status === 'closed') out.results = await tally();
+  res.json(out);
+});
+
+app.post('/api/request-link', limit(400, 3600_000), async (req, res) => {
+  // Respuesta siempre igual: no revela si un correo está registrado.
+  const generic = { ok: true, message: 'Si tu correo está en la lista de votantes, recibirás un enlace en unos minutos. Revisa también la carpeta de correo no deseado.' };
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.json(generic);
+
+  const el = await getElection();
+  if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
+
+  const { rows: [voter] } = await pool.query(
+    'select id, voted, last_sent from voters where email = $1', [email]);
+  if (!voter || voter.voted) return res.json(generic);
+  if (voter.last_sent && Date.now() - new Date(voter.last_sent) < 60_000) return res.json(generic);
+
+  try {
+    const link = await issueLink(voter.id);
+    const { text, html } = inviteBody(el.title, link);
+    await sendMail(email, `Tu enlace para votar: ${el.title}`, html, text);
+    await pool.query('update voters set invited_at = now() where id = $1', [voter.id]);
+  } catch (e) {
+    console.error('Fallo al enviar enlace a', email, '-', e.message);
+  }
+  res.json(generic);
+});
+
+app.get('/api/ballot', limit(2000, 3600_000), async (req, res) => {
+  const el = await getElection();
+  const { rows: [voter] } = await pool.query(
+    'select id from voters where token_hash = $1 and voted = false', [sha(req.query.t || '')]);
+  if (!voter) return res.status(403).json({ error: 'Este enlace no es válido o ya fue utilizado.' });
+  if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
+  const { rows: options } = await pool.query('select id, label from options order by position');
+  res.json({ title: el.title, description: el.description, options });
+});
+
+app.post('/api/vote', limit(2000, 3600_000), async (req, res) => {
+  const { token, optionId } = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const { rows: [el] } = await client.query('select status from election where id = 1');
+    if (el.status !== 'open') {
+      await client.query('rollback');
+      return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
+    }
+    const { rows: [opt] } = await client.query('select id from options where id = $1', [+optionId || 0]);
+    if (!opt) { await client.query('rollback'); return res.status(400).json({ error: 'Opción no válida.' }); }
+
+    // Marca al votante y anula su token en una sola operación atómica.
+    // Si dos peticiones llegan a la vez, solo una afecta una fila.
+    const upd = await client.query(
+      'update voters set voted = true, token_hash = null where token_hash = $1 and voted = false',
+      [sha(token || '')]);
+    if (upd.rowCount !== 1) {
+      await client.query('rollback');
+      return res.status(403).json({ error: 'Este enlace no es válido o ya fue utilizado.' });
+    }
+    // El voto se guarda sin ninguna referencia al votante.
+    await client.query('insert into votes(option_id) values ($1)', [opt.id]);
+    await client.query('commit');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('rollback').catch(() => {});
+    console.error(e);
+    res.status(500).json({ error: 'Error interno. Intenta de nuevo.' });
+  } finally {
+    client.release();
+  }
+});
+
+// -------------------------------------------------------------------- admin
+function auth(req, res, next) {
+  const [, b64] = (req.headers.authorization || '').split(' ');
+  const pass = Buffer.from(b64 || '', 'base64').toString('utf8').split(':').slice(1).join(':');
+  if (crypto.timingSafeEqual(Buffer.from(sha(pass)), Buffer.from(sha(ADMIN_PASSWORD)))) return next();
+  res.set('WWW-Authenticate', 'Basic realm="Panel de administracion"')
+    .status(401).type('text').send('Necesitas la contraseña de administración.');
+}
+
+app.get('/admin', auth, (_req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+app.get('/api/admin/state', auth, async (_req, res) => {
+  const s = await getSettings();
+  const { rows: voters } = await pool.query(
+    'select email, voted, invited_at is not null as invited from voters order by email');
+  res.json({
+    election: await getElection(),
+    results: await tally(),
+    voters,
+    baseUrl: BASE_URL,
+    mail: {
+      provider: s.provider || '',
+      from_email: s.from_email || '',
+      from_name: s.from_name || '',
+      smtp_host: s.smtp_host || '',
+      smtp_port: s.smtp_port || '',
+      smtp_user: s.smtp_user || '',
+      // Nunca se devuelven las claves, solo si existen.
+      has_brevo_key: !!s.brevo_key,
+      has_smtp_pass: !!s.smtp_pass,
+    },
+    job,
+  });
+});
+
+app.post('/api/admin/mail', auth, async (req, res) => {
+  const b = req.body || {};
+  const out = {};
+  // Solo se toca lo que viene en la petición: así guardar un campo
+  // nunca borra los demás.
+  if (b.provider !== undefined)
+    out.provider = ['brevo', 'smtp', 'test'].includes(b.provider) ? b.provider : 'test';
+  if (b.from_email !== undefined) out.from_email = String(b.from_email).trim().toLowerCase();
+  if (b.from_name !== undefined) out.from_name = String(b.from_name).trim() || 'Votación';
+  if (b.smtp_host !== undefined) out.smtp_host = String(b.smtp_host).trim();
+  if (b.smtp_port !== undefined) out.smtp_port = String(b.smtp_port).trim();
+  if (b.smtp_user !== undefined) out.smtp_user = String(b.smtp_user).trim();
+  // Las claves solo se sobrescriben si llega un valor nuevo no vacío.
+  if (b.brevo_key) out.brevo_key = String(b.brevo_key).trim();
+  if (b.smtp_pass) out.smtp_pass = String(b.smtp_pass);
+  await setSettings(out);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/mail-test', auth, async (req, res) => {
+  const to = String(req.body?.to || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Escribe un correo válido.' });
+  try {
+    await sendMail(to, 'Prueba de correo - app de votación',
+      '<p>Si lees esto, el envío de correos funciona correctamente.</p>',
+      'Si lees esto, el envío de correos funciona correctamente.');
+    const s = await getSettings();
+    res.json({ ok: true, test: s.provider !== 'brevo' && s.provider !== 'smtp' });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/setup', auth, async (req, res) => {
+  const title = String(req.body?.title || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const options = String(req.body?.options || '').split('\n').map((o) => o.trim()).filter(Boolean);
+  const { emails, duplicates } = parseEmails(req.body?.emails);
+
+  if (!title) return res.status(400).json({ error: 'Escribe la pregunta de la votación.' });
+  if (options.length < 2) return res.status(400).json({ error: 'Escribe al menos 2 opciones, una por línea.' });
+  if (options.length > 50) return res.status(400).json({ error: 'Máximo 50 opciones.' });
+  if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido en la lista de votantes.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const { rows: [el] } = await client.query('select status from election where id = 1 for update');
+    if (el.status !== 'draft') {
+      await client.query('rollback');
+      return res.status(409).json({ error: 'La votación ya fue abierta. Para cambiarla debes reiniciarla.' });
+    }
+    await client.query('delete from votes');
+    await client.query('delete from options');
+    await client.query('delete from voters');
+    await client.query('update election set title = $1, description = $2 where id = 1', [title, description]);
+    for (let i = 0; i < options.length; i++)
+      await client.query('insert into options(label, position) values ($1, $2)', [options[i], i]);
+    for (const e of emails)
+      await client.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
+    await client.query('commit');
+    res.json({ ok: true, options: options.length, voters: emails.length, duplicates });
+  } catch (e) {
+    await client.query('rollback').catch(() => {});
+    console.error(e);
+    res.status(500).json({ error: 'Error interno al guardar.' });
+  } finally {
+    client.release();
+  }
+});
+
+// Permite añadir votantes olvidados sin perder los votos ya emitidos.
+app.post('/api/admin/voters-add', auth, async (req, res) => {
+  const el = await getElection();
+  if (el.status === 'closed') return res.status(409).json({ error: 'La votación ya está cerrada.' });
+  const { emails } = parseEmails(req.body?.emails);
+  if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido.' });
+  let added = 0;
+  for (const e of emails) {
+    const r = await pool.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
+    added += r.rowCount;
+  }
+  res.json({ ok: true, added, ignored: emails.length - added });
+});
+
+app.post('/api/admin/open', auth, async (req, res) => {
+  const el = await getElection();
+  if (el.status !== 'draft') return res.status(409).json({ error: 'La votación ya fue abierta.' });
+  const { rows: [{ n }] } = await pool.query('select count(*)::int as n from options');
+  if (n < 2) return res.status(400).json({ error: 'Configura la votación antes de abrirla.' });
+  await pool.query(`update election set status = 'open' where id = 1`);
+  if (req.body?.invite) runInvitations(true).catch((e) => console.error(e));
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/invite', auth, async (req, res) => {
+  const el = await getElection();
+  if (el.status !== 'open') return res.status(409).json({ error: 'Abre la votación antes de enviar invitaciones.' });
+  if (job.running) return res.status(409).json({ error: 'Ya hay un envío en curso.' });
+  runInvitations(!req.body?.all).catch((e) => console.error(e));
+  res.json({ ok: true });
+});
+
+// Plan B si el correo no funciona: descargar los enlaces y repartirlos a mano.
+app.get('/api/admin/links.csv', auth, async (_req, res) => {
+  const el = await getElection();
+  if (el.status !== 'open') return res.status(409).type('text').send('Abre la votación primero.');
+  const { rows: voters } = await pool.query('select id, email from voters where voted = false order by email');
+  const lines = ['correo,enlace'];
+  for (const v of voters) lines.push(`${v.email},${await issueLink(v.id)}`);
+  res.set('Content-Disposition', 'attachment; filename="enlaces-votacion.csv"')
+    .type('text/csv').send(lines.join('\n'));
+});
+
+app.post('/api/admin/close', auth, async (_req, res) => {
+  const el = await getElection();
+  if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta.' });
+  await pool.query(`update election set status = 'closed' where id = 1`);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/reset', auth, async (_req, res) => {
+  if (job.running) return res.status(409).json({ error: 'Espera a que termine el envío de invitaciones.' });
+  await pool.query('delete from votes');
+  await pool.query('delete from options');
+  await pool.query('delete from voters');
+  await pool.query(`update election set title = '', description = '', status = 'draft' where id = 1`);
+  job = { running: false, total: 0, sent: 0, failed: [], finishedAt: null };
+  res.json({ ok: true });
+});
+
+init()
+  .then(() => app.listen(PORT, () => console.log(`Votación escuchando en ${BASE_URL}`)))
+  .catch((e) => { console.error('No se pudo iniciar:', e.message); process.exit(1); });
