@@ -47,6 +47,8 @@
   label.opt.off:hover{border-color:var(--line)}
   .big{font-size:2.6rem;line-height:1;margin:0 0 14px}
   .foot{text-align:center;color:var(--muted);font-size:.87rem;margin-top:22px}
+  .after{margin:16px 0 0;color:var(--muted);font-size:.95rem}
+  .after a{color:var(--brand);word-break:break-all}
 </style>
 </head>
 <body>
@@ -194,9 +196,16 @@ async function screenBallot() {
     try {
       await api('/api/vote', { token, answers });
       history.replaceState(null, '', '/');
+      // La dirección de resultados es esta misma página: al cerrar la
+      // votación muestra el recuento en vez de la papeleta.
+      const url = location.origin + '/';
       show(el('p', { className: 'big', textContent: '✓' }),
         el('h1', { textContent: 'Voto registrado' }),
         msg('Gracias por participar. Tu voto quedó guardado de forma secreta, sin vínculo con tu nombre ni tu correo.', 'ok'),
+        el('p', { className: 'after' },
+          'Cuando se cierre la votación te enviaremos los resultados a tu correo. ',
+          'También podrás consultarlos en ',
+          el('a', { href: url, textContent: url }), '.'),
         el('p', { className: 'foot', textContent: 'Ya puedes cerrar esta página.' }));
     } catch (err) {
       out.replaceChildren(msg(err.message, 'err'));
