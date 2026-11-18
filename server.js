@@ -177,8 +177,9 @@ const tally = async () => {
 };
 
 // ------------------------------------------------------------------- correo
-/** Envía un correo. Lanza un Error con mensaje legible si falla. */
-async function sendMail(to, subject, html, text) {
+/** Envía un correo. `adjuntos` = [{ name, content }] con el contenido en base64.
+ *  Lanza un Error con mensaje legible si falla. */
+async function sendMail(to, subject, html, text, adjuntos) {
   const s = await getSettings();
   const fromEmail = s.from_email || '';
   const fromName = s.from_name || 'Votación';
@@ -193,6 +194,7 @@ async function sendMail(to, subject, html, text) {
         sender: { email: fromEmail, name: fromName },
         to: [{ email: to }],
         subject, htmlContent: html, textContent: text,
+        ...(adjuntos && adjuntos.length ? { attachment: adjuntos } : {}),
       }),
     });
     if (!r.ok) {
@@ -215,7 +217,12 @@ async function sendMail(to, subject, html, text) {
       connectionTimeout: 20000, greetingTimeout: 20000,
     });
     try {
-      await t.sendMail({ from: `"${fromName}" <${fromEmail || s.smtp_user}>`, to, subject, html, text });
+      await t.sendMail({
+        from: `"${fromName}" <${fromEmail || s.smtp_user}>`, to, subject, html, text,
+        attachments: (adjuntos || []).map((a) => ({
+          filename: a.name, content: Buffer.from(a.content, 'base64'),
+        })),
+      });
     } catch (e) {
       if (/ETIMEDOUT|ECONNREFUSED|ENETUNREACH/i.test(e.code || e.message))
         throw new Error('No se pudo conectar al servidor SMTP. Si estás en el plan gratuito de Render, '
@@ -226,7 +233,95 @@ async function sendMail(to, subject, html, text) {
   }
 
   // Modo prueba: no envía nada, solo registra en la consola del servidor.
-  console.log(`[MODO PRUEBA] Para: ${to} | ${subject}\n${text}`);
+  console.log(`[MODO PRUEBA] Para: ${to} | ${subject}`
+    + (adjuntos && adjuntos.length ? ` | adjuntos: ${adjuntos.map((a) => a.name).join(', ')}` : '')
+    + `\n${text}`);
+}
+
+// ------------------------------------------------- acta de quórum
+const ZONA = 'America/Bogota'; // Para las fechas del acta.
+// 24 horas: evita el "p. m." que deja dos puntos al cerrar la frase.
+const fechaLarga = (d) => d.toLocaleString('es-CO',
+  { timeZone: ZONA, dateStyle: 'long', timeStyle: 'short', hour12: false });
+
+/** Escapa un valor para CSV. */
+const csvVal = (v) => (/[",\n;]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+const csvDoc = (filas) => '﻿' + filas.map((f) => f.map(csvVal).join(',')).join('\r\n');
+const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+
+/** Envía al organizador el acta de participación, con los CSV adjuntos. */
+async function sendQuorum() {
+  const s = await getSettings();
+  const destino = (s.organizer_email || s.from_email || '').trim();
+  if (!destino) {
+    await setSettings({ quorum_error: 'No hay correo del organizador configurado.' });
+    return;
+  }
+  const el = await getElection();
+  const { rows: voters } = await pool.query(
+    `select name, email, voted, invited_at is not null as invited
+     from voters order by voted desc, name, email`);
+  const questions = await tally();
+  const votaron = voters.filter((v) => v.voted).length;
+  const pct = voters.length ? Math.round(votaron * 1000 / voters.length) / 10 : 0;
+  const ahora = new Date();
+  const dia = ahora.toLocaleDateString('en-CA', { timeZone: ZONA }); // AAAA-MM-DD
+
+  const quorum = csvDoc([
+    ['nombre', 'correo', 'voto', 'invitado'],
+    ...voters.map((v) => [v.name, v.email, v.voted ? 'sí' : 'no', v.invited ? 'sí' : 'no']),
+  ]);
+  const resultados = csvDoc([
+    ['pregunta', 'opcion', 'votos', 'porcentaje'],
+    ...questions.flatMap((q) => {
+      const marcas = q.results.reduce((a, r) => a + r.votes, 0);
+      const base = q.pick > 1 ? q.ballots : marcas;
+      return q.results.map((r) => [q.title, r.label, r.votes,
+        (base ? Math.round(r.votes * 1000 / base) / 10 : 0) + '%']);
+    }),
+  ]);
+
+  const filas = questions.map((q) => {
+    const lista = q.results.map((r) => `${esc(r.label)}: ${r.votes}`).join(' · ');
+    return `<tr><td style="padding:4px 0"><b>${esc(q.title)}</b><br>
+      <span style="color:#667085">${lista}</span></td></tr>`;
+  }).join('');
+
+  const text = [
+    `Acta de participación: ${el.title}`, '',
+    `Votación cerrada el ${fechaLarga(ahora)}.`,
+    `Participación: ${votaron} de ${voters.length} votantes (${pct}%).`, '',
+    'Adjuntos:',
+    `  - quorum-${dia}.csv: quién votó y quién no.`,
+    `  - resultados-${dia}.csv: el recuento de cada pregunta.`, '',
+    'El acta registra quién votó, pero no qué votó: esos datos se guardan por',
+    'separado y no hay forma de relacionarlos.',
+  ].join('\n');
+
+  const html = `<div style="font-family:system-ui,Arial,sans-serif;font-size:16px;
+      line-height:1.6;color:#1c2230;max-width:560px">
+    <p style="font-size:19px;font-weight:700;margin:0 0 4px">Acta de participación</p>
+    <p style="margin:0 0 18px;color:#667085">${esc(el.title)}</p>
+    <p style="margin:0 0 6px">Votación cerrada el <b>${esc(fechaLarga(ahora))}</b>.</p>
+    <p style="margin:0 0 18px">Participación:
+      <b>${votaron} de ${voters.length}</b> votantes (${pct}%).</p>
+    <table style="width:100%;border-collapse:collapse">${filas}</table>
+    <p style="margin-top:22px">Adjuntos: la lista de quién votó y el recuento por pregunta,
+      en dos archivos CSV que puedes abrir en Excel.</p>
+    <p style="font-size:13px;color:#667085">El acta registra quién votó, pero no qué votó:
+      esos datos se guardan por separado y no hay forma de relacionarlos.</p>
+  </div>`;
+
+  try {
+    await sendMail(destino, `Acta de participación: ${el.title}`, html, text, [
+      { name: `quorum-${dia}.csv`, content: b64(quorum) },
+      { name: `resultados-${dia}.csv`, content: b64(resultados) },
+    ]);
+    await setSettings({ quorum_sent_at: ahora.toISOString(), quorum_error: '', quorum_to: destino });
+  } catch (e) {
+    console.error('Fallo al enviar el acta:', e.message);
+    await setSettings({ quorum_error: e.message });
+  }
 }
 
 // ----------------------------------------- mensaje de invitación editable
@@ -565,6 +660,11 @@ app.get('/api/admin/state', auth, async (_req, res) => {
     voters,
     baseUrl: BASE_URL,
     resultsSentAt: s.results_sent_at || '',
+    quorum: {
+      sentAt: s.quorum_sent_at || '',
+      to: s.quorum_to || '',
+      error: s.quorum_error || '',
+    },
     invite: {
       subject: s.invite_subject || ASUNTO_POR_DEFECTO,
       body: s.invite_body || MENSAJE_POR_DEFECTO,
@@ -574,6 +674,7 @@ app.get('/api/admin/state', auth, async (_req, res) => {
       provider: s.provider || '',
       from_email: s.from_email || '',
       from_name: s.from_name || '',
+      organizer_email: s.organizer_email || '',
       smtp_host: s.smtp_host || '',
       smtp_port: s.smtp_port || '',
       smtp_user: s.smtp_user || '',
@@ -593,6 +694,7 @@ app.post('/api/admin/mail', auth, async (req, res) => {
   if (b.provider !== undefined)
     out.provider = ['brevo', 'smtp', 'test'].includes(b.provider) ? b.provider : 'test';
   if (b.from_email !== undefined) out.from_email = String(b.from_email).trim().toLowerCase();
+  if (b.organizer_email !== undefined) out.organizer_email = String(b.organizer_email).trim().toLowerCase();
   if (b.from_name !== undefined) out.from_name = String(b.from_name).trim() || 'Votación';
   if (b.smtp_host !== undefined) out.smtp_host = String(b.smtp_host).trim();
   if (b.smtp_port !== undefined) out.smtp_port = String(b.smtp_port).trim();
@@ -774,8 +876,21 @@ app.post('/api/admin/close', auth, async (req, res) => {
   if (req.body?.notify && job.running)
     return res.status(409).json({ error: 'Espera a que termine el envío en curso.' });
   await pool.query(`update election set status = 'closed' where id = 1`);
+  // El acta sale siempre al cerrar; el correo a los votantes es opcional.
+  sendQuorum().catch((e) => console.error(e));
   if (req.body?.notify) runResults().catch((e) => console.error(e));
   res.json({ ok: true });
+});
+
+// Volver a enviar el acta de participación al organizador.
+app.post('/api/admin/quorum-mail', auth, async (_req, res) => {
+  const el = await getElection();
+  if (el.status !== 'closed')
+    return res.status(409).json({ error: 'El acta se genera al cerrar la votación.' });
+  await sendQuorum();
+  const s = await getSettings();
+  if (s.quorum_error) return res.status(400).json({ error: s.quorum_error });
+  res.json({ ok: true, to: s.quorum_to || '' });
 });
 
 // Enviar (o reenviar) los resultados a todos los votantes.
@@ -795,7 +910,7 @@ app.post('/api/admin/reset', auth, async (_req, res) => {
   await pool.query('delete from questions');
   await pool.query('delete from voters');
   await pool.query(`update election set title = '', description = '', status = 'draft' where id = 1`);
-  await setSettings({ results_sent_at: '' });
+  await setSettings({ results_sent_at: '', quorum_sent_at: '', quorum_error: '', quorum_to: '' });
   job = { running: false, kind: '', total: 0, sent: 0, failed: [], finishedAt: null };
   res.json({ ok: true });
 });

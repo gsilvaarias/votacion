@@ -164,6 +164,7 @@ function stepMail() {
   ].map(([v, t]) => el('option', { value: v, textContent: t, selected: (m.provider || 'brevo') === v })));
 
   const fromEmail = el('input', { type: 'email', value: m.from_email, placeholder: 'votacion@tucorreo.com' });
+  const organizer = el('input', { type: 'email', value: m.organizer_email, placeholder: 'secretaria@tucorreo.com' });
   const fromName = el('input', { value: m.from_name || 'Votación', placeholder: 'Comité electoral' });
   const brevoKey = el('input', { type: 'password', placeholder: m.has_brevo_key ? '•••••• (ya guardada, deja vacío para no cambiarla)' : 'xkeysib-...' });
   const host = el('input', { value: m.smtp_host, placeholder: 'smtp.midominio.com' });
@@ -193,6 +194,7 @@ function stepMail() {
     try {
       await post('/api/admin/mail', {
         provider: provider.value, from_email: fromEmail.value, from_name: fromName.value,
+        organizer_email: organizer.value,
         brevo_key: brevoKey.value, smtp_host: host.value, smtp_port: port.value,
         smtp_user: user.value, smtp_pass: pass.value,
       });
@@ -226,6 +228,8 @@ function stepMail() {
       el('div', {}, el('label', { textContent: 'Correo del remitente' }), fromEmail),
       el('div', {}, el('label', { textContent: 'Nombre del remitente' }), fromName)),
     el('p', { className: 'hint', textContent: 'Con Brevo, el correo del remitente debe estar verificado en Brevo (Settings → Senders). Te llega un correo de confirmación con un clic.' }),
+    el('label', { textContent: 'Correo del organizador' }), organizer,
+    el('p', { className: 'hint', textContent: 'Aquí llega el acta de participación al cerrar la votación: quién votó y quién no, con el recuento, en dos archivos CSV. Si lo dejas vacío, se usa el correo del remitente.' }),
     save,
     el('hr', { style: 'border:0;border-top:1px solid var(--line);margin:22px 0' }),
     el('label', { textContent: 'Probar el envío' }), testTo, test, out);
@@ -517,7 +521,8 @@ function stepResults() {
     const cerrar = async (notify, btn) => {
       if (!confirm('Se cierra la votación definitivamente. Quien no haya votado ya no podrá hacerlo '
         + 'y los resultados quedarán visibles para todos'
-        + (notify ? ', además de enviarse por correo a todos los votantes' : '') + '. ¿Continuar?')) return;
+        + (notify ? ', además de enviarse por correo a todos los votantes' : '')
+        + '. También recibirás el acta de participación. ¿Continuar?')) return;
       btn.disabled = true;
       try {
         await post('/api/admin/close', { notify });
@@ -551,6 +556,29 @@ function stepResults() {
       if (yaSent) body.append(el('p', { className: 'hint',
         textContent: 'Resultados enviados el ' + new Date(S.resultsSentAt).toLocaleString('es-CO') + '.' }));
     }
+
+    // Acta de participación para el archivo de la organización.
+    const q = S.quorum;
+    const acta = el('div', { className: 'preview' },
+      el('label', { textContent: 'Acta de participación' }));
+    if (q.error) {
+      acta.append(note('No se pudo enviar el acta: ' + q.error, 'err'));
+    } else if (q.sentAt) {
+      acta.append(note(`Acta enviada a ${q.to} el `
+        + new Date(q.sentAt).toLocaleString('es-CO')
+        + ', con la lista de quién votó y el recuento en dos archivos CSV.', 'ok'));
+    } else {
+      acta.append(note('Todavía no se ha enviado el acta.', 'warn'));
+    }
+    const reenviar = el('button', { className: 'sec', textContent: 'Enviar el acta de nuevo' });
+    reenviar.onclick = async () => {
+      reenviar.disabled = true;
+      try { await post('/api/admin/quorum-mail'); setFlash(4, 'Acta enviada.', 'ok'); await load(); return; }
+      catch (e) { acta.append(note(e.message, 'err')); }
+      reenviar.disabled = false;
+    };
+    acta.append(reenviar);
+    body.append(acta);
   }
 
   const list = el('table', {}, el('tr', {},
