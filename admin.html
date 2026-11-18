@@ -65,6 +65,10 @@
   .qdel{margin:0;padding:5px 11px;font-size:.85rem}
   .qcard label{margin-top:10px}
   .qcard textarea{min-height:82px}
+  .msgbody{min-height:290px;font-size:.92rem;line-height:1.55}
+  .preview{margin-top:16px;border-top:1px solid var(--line);padding-top:14px}
+  iframe.vista{width:100%;height:520px;border:1px solid var(--line);border-radius:9px;background:#fff}
+  .dim{color:var(--muted)}
   .pickrow{display:flex;align-items:center;gap:12px}
   .pickrow .qpick{width:78px;flex:none}
   .pickrow .hint{margin:0}
@@ -247,7 +251,10 @@ function stepElection() {
   if (st === 'draft') {
     const title = el('input', { value: S.election.title, placeholder: 'Asamblea ordinaria del 3 de diciembre' });
     const desc = el('input', { value: S.election.description, placeholder: 'Sede Bogotá · segunda convocatoria' });
-    const emails = el('textarea', { value: S.voters.map((v) => v.email).join('\n'), placeholder: 'ana@correo.com\nluis@correo.com' });
+    const emails = el('textarea', {
+      value: S.voters.map((v) => (v.name ? `${v.name}, ${v.email}` : v.email)).join('\n'),
+      placeholder: 'Ana Restrepo, ana@correo.com\nLuis Gómez, luis@correo.com',
+    });
     const box = el('div', {});
 
     // Cada pregunta es una tarjeta con su texto y sus opciones. Se añaden y
@@ -300,7 +307,10 @@ function stepElection() {
         });
         setFlash(2, `Guardado: ${r.questions} ${r.questions === 1 ? 'pregunta' : 'preguntas'}, `
           + `${r.options} opciones y ${r.voters} votantes`
-          + (r.duplicates ? `. Se ignoraron ${r.duplicates} correos repetidos.` : '.'), 'ok');
+          + (r.duplicates ? `. Se ignoraron ${r.duplicates} correos repetidos.` : '.')
+          + (r.sinNombre ? ` Ojo: ${r.sinNombre} ${r.sinNombre === 1 ? 'votante se quedó' : 'votantes se quedaron'}`
+            + ' sin nombre y recibirán el correo sin saludo personal.' : ''),
+          r.sinNombre ? 'warn' : 'ok');
         await load();
         return;
       } catch (e) { out.replaceChildren(note(e.message, 'err')); }
@@ -312,8 +322,8 @@ function stepElection() {
       el('p', { className: 'hint', textContent: 'Es el título que ven los votantes arriba de todo. Con una sola pregunta, puedes repetir aquí esa pregunta.' }),
       el('label', { textContent: 'Descripción (opcional)' }), desc,
       el('label', { textContent: 'Preguntas' }), box, addBtn,
-      el('label', { textContent: 'Correos de los votantes' }), emails,
-      el('p', { className: 'hint', textContent: 'Pega la lista tal como la tengas: una por línea, separadas por comas o copiada de Excel. Los repetidos se descartan solos.' }),
+      el('label', { textContent: 'Votantes: nombre y correo, uno por línea' }), emails,
+      el('p', { className: 'hint', textContent: 'Escribe "Ana Restrepo, ana@correo.com" en cada línea; también vale pegar dos columnas desde Excel. El nombre se usa para saludar en el correo. Si solo pones el correo, el saludo queda sin nombre. Los repetidos se descartan solos.' }),
       save, out);
     const done = S.questions.length >= 1 && S.voters.length > 0;
     return step(2, 'Crear la votación', 'Revísala bien: al abrirla ya no podrás cambiarla.',
@@ -350,6 +360,56 @@ function stepElection() {
   return step(2, 'La votación', '', 'done', info);
 }
 
+// --------------------------------- editor del correo de invitación
+function editorMensaje() {
+  const out = el('div');
+  const subject = el('input', { value: S.invite.subject });
+  const body = el('textarea', { className: 'msgbody', value: S.invite.body });
+  const vista = el('div', { className: 'preview', hidden: true });
+
+  const guardar = el('button', { textContent: 'Guardar el texto' });
+  guardar.onclick = async () => {
+    guardar.disabled = true;
+    try {
+      await post('/api/admin/invite-text', { subject: subject.value, body: body.value });
+      setFlash(3, 'Texto del correo guardado.', 'ok');
+      await load();
+      return;
+    } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+    guardar.disabled = false;
+  };
+
+  const ver = el('button', { className: 'sec', textContent: 'Ver cómo queda' });
+  ver.onclick = async () => {
+    ver.disabled = true;
+    try {
+      const nombre = (S.voters.find((v) => v.name) || {}).name || 'Ana Restrepo';
+      const r = await post('/api/admin/invite-preview',
+        { subject: subject.value, body: body.value, name: nombre });
+      const marco = el('iframe', { className: 'vista' });
+      vista.replaceChildren(
+        el('p', { className: 'kv' }, 'Asunto: ', el('b', { textContent: r.subject })),
+        marco);
+      vista.hidden = false;
+      marco.srcdoc = r.html;
+      out.replaceChildren();
+    } catch (e) { out.replaceChildren(note(e.message, 'err')); }
+    ver.disabled = false;
+  };
+
+  return el('details', { open: !!(flash && flash.step === 3) },
+    el('summary', { textContent: 'Texto del correo de invitación. Pulsa para verlo o cambiarlo.' }),
+    el('label', { textContent: 'Asunto' }), subject,
+    el('label', { textContent: 'Mensaje' }), body,
+    el('p', { className: 'hint' },
+      'Donde escribas ', el('code', { textContent: '{NOMBRE}' }),
+      ' va el nombre de cada persona; si no tiene nombre en la lista, se quita junto con la coma que lo precede. ',
+      'La línea ', el('code', { textContent: S.invite.marker }),
+      ' se convierte en el botón para votar, así que no la borres. ',
+      'Para un enlace con texto, escribe ', el('code', { textContent: '[texto del enlace](https://…)' }), '.'),
+    guardar, ver, vista, out);
+}
+
 // ------------------------------------------------------- 3. invitaciones
 function stepInvites() {
   const st = S.election.status;
@@ -377,7 +437,7 @@ function stepInvites() {
     };
     return step(3, 'Abrir e invitar',
       ready ? 'Cada votante recibirá un correo con su enlace personal.' : 'Primero completa el paso 2.',
-      ready ? 'now' : '', open, only, out);
+      ready ? 'now' : '', editorMensaje(), open, only, out);
   }
 
   if (st === 'closed') return step(3, 'Invitaciones enviadas', '', 'done',
@@ -406,7 +466,7 @@ function stepInvites() {
     try { await post('/api/admin/invite', { all: true }); startPolling(); } catch (e) { out.replaceChildren(note(e.message, 'err')); }
   };
 
-  body.append(send, resend,
+  body.append(editorMensaje(), send, resend,
     el('a', { className: 'btn', href: '/api/admin/links.csv', textContent: 'Descargar enlaces (CSV)' }),
     el('p', { className: 'hint', textContent: 'El CSV es el plan B: si los correos no llegan, reparte los enlaces por WhatsApp o impresos. Descargarlo genera enlaces nuevos y anula los anteriores de quienes no han votado.' }),
     el('p', { className: 'kv' }, 'Página para los votantes: ', el('code', { textContent: S.baseUrl })),
@@ -497,7 +557,8 @@ function stepResults() {
     el('th', { textContent: 'Votante' }), el('th', { textContent: 'Estado' })));
   for (const v of S.voters)
     list.append(el('tr', {},
-      el('td', { textContent: v.email }),
+      el('td', {}, el('b', { textContent: v.name || '(sin nombre)' }),
+        el('span', { className: 'dim', textContent: ' ' + v.email })),
       el('td', { textContent: v.voted ? '✓ votó' : (v.invited ? 'invitado, sin votar' : 'sin invitar') })));
   body.append(el('label', { textContent: 'Quién ha votado' }),
     el('p', { className: 'hint', textContent: 'Se registra quién votó, pero no qué votó: las dos cosas se guardan por separado.' }),

@@ -43,6 +43,22 @@ npm run dev
 En el panel, deja el envío de correo en **modo prueba**: los enlaces se
 imprimen en la consola del servidor en vez de enviarse.
 
+## Correo de invitación
+
+El asunto y el cuerpo se editan en el panel (paso 3) y se guardan en la tabla
+`settings`, así que cambiarlos no requiere volver a desplegar. El cuerpo
+admite:
+
+- `{NOMBRE}` — el nombre del votante. Si no tiene, se elimina junto con la
+  coma que lo precede, de modo que `Hola, {NOMBRE}:` queda `Hola:`.
+- `[ Votar ahora ]` en una línea propia — se sustituye por el botón con el
+  enlace personal. Si falta, el servidor lo añade al final de todos modos.
+- `[texto](https://…)` — enlace con texto propio. Las direcciones sueltas
+  también se enlazan solas.
+
+La lista de votantes acepta `Nombre, correo`, `Nombre <correo>`, dos columnas
+pegadas desde Excel, o solo el correo.
+
 ## Notas técnicas
 
 - Una votación tiene N preguntas (`questions`), cada una con sus `options` y

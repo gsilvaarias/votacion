@@ -41,16 +41,34 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
 
-/** Extrae correos de un texto pegado desde Excel, Word o un correo.
- *  Tolera saltos de línea, comas, punto y coma, tabulaciones y "Nombre <correo>". */
-function parseEmails(text) {
-  const found = String(text || '').match(EMAIL_RE) || [];
-  const seen = new Set(); const list = [];
-  for (const raw of found) {
-    const e = raw.toLowerCase();
-    if (!seen.has(e)) { seen.add(e); list.push(e); }
+/** Extrae nombre y correo de una lista pegada desde Excel, Word o un correo.
+ *  Acepta "Ana Restrepo, ana@x.com", "Ana Restrepo <ana@x.com>", una columna
+ *  de correos sueltos, o varios correos en la misma línea. */
+function parseVoters(text) {
+  const out = []; const seen = new Set(); let duplicates = 0;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const found = line.match(EMAIL_RE) || [];
+    if (!found.length) continue;
+    // El nombre solo tiene sentido cuando la línea trae un único correo.
+    let name = '';
+    if (found.length === 1) {
+      name = line.replace(found[0], ' ')
+        .replace(/[<>"']/g, ' ')
+        .replace(/[,;\t|]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/^[-–—:.]+|[-–—:.]+$/g, '')
+        .trim()
+        .slice(0, 120);
+    }
+    for (const raw of found) {
+      const email = raw.toLowerCase();
+      if (seen.has(email)) { duplicates++; continue; }
+      seen.add(email);
+      out.push({ name, email });
+    }
   }
-  return { emails: list, duplicates: found.length - list.length };
+  return { voters: out, duplicates };
 }
 
 // ---------------------------------------------------------- base de datos
@@ -76,6 +94,7 @@ async function init() {
     create table if not exists voters(
       id serial primary key,
       email text unique not null,
+      name text not null default '',
       token_hash text,
       last_sent timestamptz,
       invited_at timestamptz,
@@ -87,6 +106,7 @@ async function init() {
   `);
   // Compatibilidad con bases creadas por versiones anteriores.
   await pool.query(`alter table voters add column if not exists invited_at timestamptz`);
+  await pool.query(`alter table voters add column if not exists name text not null default ''`);
   await pool.query(`alter table options add column if not exists question_id int
                     references questions(id) on delete cascade`);
   // pick = cuántas opciones debe marcar el votante en esa pregunta.
@@ -209,22 +229,82 @@ async function sendMail(to, subject, html, text) {
   console.log(`[MODO PRUEBA] Para: ${to} | ${subject}\n${text}`);
 }
 
-function inviteBody(title, link) {
-  const text = `Tienes derecho a voto en: ${title}\n\n`
-    + `Abre este enlace personal para votar (funciona una sola vez):\n${link}\n\n`
-    + `No compartas este enlace con nadie.`;
-  const html = `<div style="font-family:system-ui,Arial,sans-serif;font-size:16px;line-height:1.6;color:#1c2230">
-    <p>Tienes derecho a voto en:</p>
-    <p style="font-size:19px;font-weight:700">${esc(title)}</p>
-    <p>Pulsa el botón para votar. El enlace es personal y funciona una sola vez.</p>
-    <p style="margin:26px 0"><a href="${esc(link)}"
+// ----------------------------------------- mensaje de invitación editable
+// El texto se guarda en el panel. Admite {NOMBRE}, enlaces [texto](url) y la
+// línea [ Votar ahora ], que se convierte en el botón con el enlace personal.
+const BOTON = '[ Votar ahora ]';
+const LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+const A = 'style="color:#2f5bea"';
+
+const ASUNTO_POR_DEFECTO = 'Elección de la Junta Directiva de la COLEVOL: tu enlace para votar';
+const MENSAJE_POR_DEFECTO = `Hola, {NOMBRE}:
+
+La Asociación Colombiana de Biología Evolutiva - COLEVOL está renovando su Junta Directiva y, como miembro, tienes derecho a voto.
+
+Se eligen siete cargos: Presidencia, Secretaría, Tesorería y cuatro Vocalías. Podrás responder todo en pocos minutos. [Puedes ver información de las candidatas y los candidatos aquí](https://drive.google.com/file/d/1AWfEQ5Gr6rsg46QlJQyAqMox40x-4nad/view?usp=drive_link)
+
+${BOTON}
+
+El enlace de arriba es personal y funciona una sola vez, así que te pedimos no compartirlo con nadie.
+
+Tu voto es importante, necesitamos alcanzar el quórum de votación para validar la nueva junta. Tienes plazo hasta el 18 de diciembre.
+
+Además, tu voto es secreto: el sistema registra que votaste, para efectos de quórum, pero no guarda ningún vínculo entre tu nombre y las opciones que elijas. La plataforma se publica en Render y envía los correos con Brevo; su código está disponible para quien quiera revisarlo en https://github.com/gsilvaarias/votacion
+
+Gracias por participar en la vida de COLEVOL.
+
+Junta Directiva
+Asociación Colombiana de Biología Evolutiva`;
+
+/** Quita {NOMBRE} y la coma que lo precede cuando el votante no tiene nombre. */
+const ponNombre = (s, name) => (name
+  ? s.replace(/\{NOMBRE\}/g, name)
+  : s.replace(/,?[ \t]*\{NOMBRE\}/g, ''));
+
+function inlineHtml(s) {
+  const guardados = [];
+  let out = esc(s).replace(LINK_RE, (m, t, u) => {
+    guardados.push(`<a href="${u}" ${A}>${t}</a>`);
+    return `\u0000${guardados.length - 1}\u0000`;
+  });
+  // Direcciones escritas sueltas también se vuelven enlace.
+  out = out.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,
+    (m, pre, u) => `${pre}<a href="${u}" ${A}>${u}</a>`);
+  return out.replace(/\u0000(\d+)\u0000/g, (m, i) => guardados[+i]).replace(/\n/g, '<br>');
+}
+const inlineText = (s) => s.replace(LINK_RE, (m, t, u) => `${t}: ${u}`);
+
+/** Arma el correo de invitación de un votante concreto. */
+function inviteBody(body, name, link) {
+  const parrafos = ponNombre(String(body || ''), name)
+    .split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  const boton = `<p style="margin:26px 0"><a href="${esc(link)}"
       style="background:#2f5bea;color:#fff;padding:13px 26px;border-radius:8px;
-      text-decoration:none;font-weight:600;display:inline-block">Votar ahora</a></p>
-    <p style="font-size:13px;color:#667085">Si el botón no funciona, copia esta dirección:<br>
-      <span style="word-break:break-all">${esc(link)}</span></p>
-    <p style="font-size:13px;color:#667085">No compartas este enlace con nadie.</p>
-  </div>`;
-  return { text, html };
+      text-decoration:none;font-weight:600;display:inline-block">Votar ahora</a></p>`;
+  const botonTexto = `Para votar, abre este enlace:\n${link}`;
+
+  let html = '', text = '', puesto = false;
+  for (const p of parrafos) {
+    if (p === BOTON) {
+      puesto = true;
+      html += boton;
+      text += botonTexto + '\n\n';
+    } else {
+      html += `<p style="margin:0 0 14px">${inlineHtml(p)}</p>`;
+      text += inlineText(p) + '\n\n';
+    }
+  }
+  // Por si alguien borra la marca del botón: el correo nunca sale sin enlace.
+  if (!puesto) { html += boton; text += botonTexto + '\n\n'; }
+
+  html += `<p style="font-size:13px;color:#667085;margin-top:22px">
+    Si el botón no funciona, copia esta dirección en tu navegador:<br>
+    <span style="word-break:break-all">${esc(link)}</span></p>`;
+  return {
+    text: text.trim(),
+    html: `<div style="font-family:system-ui,Arial,sans-serif;font-size:16px;
+      line-height:1.6;color:#1c2230;max-width:560px">${html}</div>`,
+  };
 }
 
 /** Correo con los resultados, que se manda a todos los votantes al cerrar. */
@@ -286,16 +366,18 @@ let job = { running: false, kind: '', total: 0, sent: 0, failed: [], finishedAt:
 async function runInvitations(onlyPending) {
   if (job.running) return;
   const { rows: voters } = await pool.query(
-    `select id, email from voters
+    `select id, email, name from voters
      where voted = false ${onlyPending ? 'and invited_at is null' : ''}
      order by id`);
   job = { running: true, kind: 'invitaciones', total: voters.length, sent: 0, failed: [], finishedAt: null };
-  const { title } = await getElection();
+  const s = await getSettings();
+  const asunto = s.invite_subject || ASUNTO_POR_DEFECTO;
+  const cuerpo = s.invite_body || MENSAJE_POR_DEFECTO;
   for (const v of voters) {
     try {
       const link = await issueLink(v.id);
-      const { text, html } = inviteBody(title, link);
-      await sendMail(v.email, `Tu enlace para votar: ${title}`, html, text);
+      const { text, html } = inviteBody(cuerpo, v.name, link);
+      await sendMail(v.email, ponNombre(asunto, v.name), html, text);
       await pool.query('update voters set invited_at = now() where id = $1', [v.id]);
       job.sent++;
     } catch (e) {
@@ -370,14 +452,15 @@ app.post('/api/request-link', limit(400, 3600_000), async (req, res) => {
   if (el.status !== 'open') return res.status(409).json({ error: 'La votación no está abierta en este momento.' });
 
   const { rows: [voter] } = await pool.query(
-    'select id, voted, last_sent from voters where email = $1', [email]);
+    'select id, voted, last_sent, name from voters where email = $1', [email]);
   if (!voter || voter.voted) return res.json(generic);
   if (voter.last_sent && Date.now() - new Date(voter.last_sent) < 60_000) return res.json(generic);
 
   try {
     const link = await issueLink(voter.id);
-    const { text, html } = inviteBody(el.title, link);
-    await sendMail(email, `Tu enlace para votar: ${el.title}`, html, text);
+    const s = await getSettings();
+    const { text, html } = inviteBody(s.invite_body || MENSAJE_POR_DEFECTO, voter.name, link);
+    await sendMail(email, ponNombre(s.invite_subject || ASUNTO_POR_DEFECTO, voter.name), html, text);
     await pool.query('update voters set invited_at = now() where id = $1', [voter.id]);
   } catch (e) {
     console.error('Fallo al enviar enlace a', email, '-', e.message);
@@ -474,7 +557,7 @@ app.get('/admin', auth, (_req, res) => res.sendFile(path.join(__dirname, 'admin.
 app.get('/api/admin/state', auth, async (_req, res) => {
   const s = await getSettings();
   const { rows: voters } = await pool.query(
-    'select email, voted, invited_at is not null as invited from voters order by email');
+    'select email, name, voted, invited_at is not null as invited from voters order by email');
   res.json({
     election: await getElection(),
     results: await tally(),
@@ -482,6 +565,11 @@ app.get('/api/admin/state', auth, async (_req, res) => {
     voters,
     baseUrl: BASE_URL,
     resultsSentAt: s.results_sent_at || '',
+    invite: {
+      subject: s.invite_subject || ASUNTO_POR_DEFECTO,
+      body: s.invite_body || MENSAJE_POR_DEFECTO,
+      marker: BOTON,
+    },
     mail: {
       provider: s.provider || '',
       from_email: s.from_email || '',
@@ -516,6 +604,30 @@ app.post('/api/admin/mail', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Texto del correo de invitación, editable desde el panel.
+app.post('/api/admin/invite-text', auth, async (req, res) => {
+  const subject = String(req.body?.subject || '').trim();
+  const body = String(req.body?.body || '').trim();
+  if (!subject) return res.status(400).json({ error: 'El asunto no puede quedar vacío.' });
+  if (body.length < 20) return res.status(400).json({ error: 'El mensaje es demasiado corto.' });
+  if (!body.includes(BOTON))
+    return res.status(400).json({
+      error: `Falta la línea ${BOTON} en el mensaje: es donde se coloca el botón para votar.`,
+    });
+  await setSettings({ invite_subject: subject, invite_body: body });
+  res.json({ ok: true });
+});
+
+// Vista previa del correo tal y como lo recibiría un votante.
+app.post('/api/admin/invite-preview', auth, async (req, res) => {
+  const s = await getSettings();
+  const body = String(req.body?.body ?? (s.invite_body || MENSAJE_POR_DEFECTO));
+  const subject = String(req.body?.subject ?? (s.invite_subject || ASUNTO_POR_DEFECTO));
+  const name = String(req.body?.name || '').trim();
+  const { html, text } = inviteBody(body, name, `${BASE_URL}/?t=EJEMPLO`);
+  res.json({ subject: ponNombre(subject, name), html, text });
+});
+
 app.post('/api/admin/mail-test', auth, async (req, res) => {
   const to = String(req.body?.to || '').trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'Escribe un correo válido.' });
@@ -533,7 +645,7 @@ app.post('/api/admin/mail-test', auth, async (req, res) => {
 app.post('/api/admin/setup', auth, async (req, res) => {
   const title = String(req.body?.title || '').trim();
   const description = String(req.body?.description || '').trim();
-  const { emails, duplicates } = parseEmails(req.body?.emails);
+  const { voters: lista, duplicates } = parseVoters(req.body?.emails);
 
   // Cada pregunta trae su propio texto y sus opciones, una por línea.
   const questions = (Array.isArray(req.body?.questions) ? req.body.questions : [])
@@ -560,7 +672,7 @@ app.post('/api/admin/setup', auth, async (req, res) => {
           + `${questions[i].options.length}${n}.`,
       });
   }
-  if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido en la lista de votantes.' });
+  if (!lista.length) return res.status(400).json({ error: 'No encontré ningún correo válido en la lista de votantes.' });
 
   const client = await pool.connect();
   try {
@@ -586,11 +698,16 @@ app.post('/api/admin/setup', auth, async (req, res) => {
         nOptions++;
       }
     }
-    for (const e of emails)
-      await client.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
+    for (const v of lista)
+      await client.query('insert into voters(email, name) values ($1, $2) on conflict do nothing',
+        [v.email, v.name]);
     await client.query('commit');
     await setSettings({ results_sent_at: '' });
-    res.json({ ok: true, questions: questions.length, options: nOptions, voters: emails.length, duplicates });
+    res.json({
+      ok: true, questions: questions.length, options: nOptions,
+      voters: lista.length, duplicates,
+      sinNombre: lista.filter((v) => !v.name).length,
+    });
   } catch (e) {
     await client.query('rollback').catch(() => {});
     console.error(e);
@@ -604,14 +721,15 @@ app.post('/api/admin/setup', auth, async (req, res) => {
 app.post('/api/admin/voters-add', auth, async (req, res) => {
   const el = await getElection();
   if (el.status === 'closed') return res.status(409).json({ error: 'La votación ya está cerrada.' });
-  const { emails } = parseEmails(req.body?.emails);
-  if (!emails.length) return res.status(400).json({ error: 'No encontré ningún correo válido.' });
+  const { voters: lista } = parseVoters(req.body?.emails);
+  if (!lista.length) return res.status(400).json({ error: 'No encontré ningún correo válido.' });
   let added = 0;
-  for (const e of emails) {
-    const r = await pool.query('insert into voters(email) values ($1) on conflict do nothing', [e]);
+  for (const v of lista) {
+    const r = await pool.query(
+      'insert into voters(email, name) values ($1, $2) on conflict do nothing', [v.email, v.name]);
     added += r.rowCount;
   }
-  res.json({ ok: true, added, ignored: emails.length - added });
+  res.json({ ok: true, added, ignored: lista.length - added });
 });
 
 app.post('/api/admin/open', auth, async (req, res) => {
@@ -641,9 +759,11 @@ app.post('/api/admin/invite', auth, async (req, res) => {
 app.get('/api/admin/links.csv', auth, async (_req, res) => {
   const el = await getElection();
   if (el.status !== 'open') return res.status(409).type('text').send('Abre la votación primero.');
-  const { rows: voters } = await pool.query('select id, email from voters where voted = false order by email');
-  const lines = ['correo,enlace'];
-  for (const v of voters) lines.push(`${v.email},${await issueLink(v.id)}`);
+  const { rows: voters } = await pool.query(
+    'select id, email, name from voters where voted = false order by email');
+  const csv = (s) => (/[",\n]/.test(s) ? `"${String(s).replace(/"/g, '""')}"` : s);
+  const lines = ['nombre,correo,enlace'];
+  for (const v of voters) lines.push(`${csv(v.name)},${v.email},${await issueLink(v.id)}`);
   res.set('Content-Disposition', 'attachment; filename="enlaces-votacion.csv"')
     .type('text/csv').send(lines.join('\n'));
 });
